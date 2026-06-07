@@ -1,0 +1,227 @@
+# =============================================================================
+# Persian RTL E-Commerce — container orchestration
+#
+# Profiles:
+#   dev   -> hot-reload API (bind-mounted) + pgAdmin
+#   prod  -> multi-worker API, no source mount, no pgAdmin
+#
+# Datastores (postgres, redis) and the one-shot migrate job carry NO profile,
+# so they start under either profile.
+#
+# Usage:
+#   docker compose --profile dev  up --build      # development
+#   docker compose --profile prod up -d --build   # production
+#
+# Startup order is enforced by health-gated depends_on (see README-DOCKER.md):
+#   postgres+redis (healthy) -> migrate (completes) -> api (starts)
+# =============================================================================
+
+name: ecommerce
+
+# --- Reusable anchors --------------------------------------------------------
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-app-env: &app-env
+  ENVIRONMENT: ${ENVIRONMENT:-production}
+  REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+  JWT_SECRET: ${JWT_SECRET}
+  OTP_PEPPER: ${OTP_PEPPER}
+  SMS_PROVIDER: ${SMS_PROVIDER:-console}
+  DEFAULT_LOCALE: ${DEFAULT_LOCALE:-fa-IR}
+  CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:3000"]}
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 16
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # Fail fast if a password is ever blank.
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    # Bound to localhost only — not exposed to the public interface.
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 1g }
+
+  # ---------------------------------------------------------------------------
+  # Redis 7 (cache, OTP store, rate limiting, sessions)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    environment:
+      # Lets redis-cli authenticate without passing -a (no plaintext in ps).
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 384m }
+
+  # ---------------------------------------------------------------------------
+  # Alembic migrations — one-shot job. Runs to completion, then exits 0.
+  # The API services wait for this via service_completed_successfully.
+  # Uses the SYNC psycopg driver (the app uses async asyncpg).
+  # ---------------------------------------------------------------------------
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: ecommerce-api:${IMAGE_TAG:-latest}
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      <<: *app-env
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [backend]
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # API — PRODUCTION profile (multi-worker, immutable image, no mount)
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: ecommerce-api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    profiles: ["prod"]
+    command: ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "${API_WORKERS:-4}", "--proxy-headers"]
+    environment:
+      <<: *app-env
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    logging: *default-logging
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 1g }
+
+  # ---------------------------------------------------------------------------
+  # API — DEVELOPMENT profile (hot reload, source bind-mounted)
+  # ---------------------------------------------------------------------------
+  api-dev:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: ecommerce-api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    profiles: ["dev"]
+    command: ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    environment:
+      <<: *app-env
+      ENVIRONMENT: development
+      DEBUG: "true"
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    volumes:
+      # Live code reload; named volume shields the baked venv from the mount.
+      - ./backend:/app
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # pgAdmin — DEVELOPMENT only
+  # ---------------------------------------------------------------------------
+  pgadmin:
+    image: dpage/pgadmin4:8
+    restart: unless-stopped
+    profiles: ["dev"]
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
+      PGADMIN_DISABLE_POSTFIX: "true"
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    ports:
+      - "127.0.0.1:${PGADMIN_PORT:-5050}:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:80/misc/ping',timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging: *default-logging
+
+# --- Persistent state --------------------------------------------------------
+volumes:
+  pg_data:
+    driver: local
+  redis_data:
+    driver: local
+  pgadmin_data:
+    driver: local
+
+# --- Private network ---------------------------------------------------------
+networks:
+  backend:
+    driver: bridge

@@ -1,0 +1,17 @@
+# --- Web / API ---
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+pydantic-settings>=2.3
+
+# --- Persistence ---
+SQLAlchemy>=2.0
+asyncpg>=0.29          # async driver used by the app
+psycopg[binary]>=3.1   # sync driver used by Alembic
+alembic>=1.13
+
+# --- Cache / sessions / OTP store ---
+redis>=5.0
+
+# --- Auth ---
+PyJWT>=2.8

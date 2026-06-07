@@ -1,0 +1,5 @@
+# Minimal deps to run the Alembic migrations.
+# The full backend will add fastapi, redis, etc. in its own requirements file.
+alembic>=1.13
+SQLAlchemy>=2.0
+psycopg[binary]>=3.1

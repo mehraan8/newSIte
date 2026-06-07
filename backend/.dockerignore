@@ -1,0 +1,41 @@
+# Keep the build context small, fast, and free of secrets.
+
+# Python caches / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Virtual environments (deps are installed inside the image)
+.venv/
+venv/
+env/
+
+# Secrets & local env — must never be baked into an image layer
+.env
+.env.*
+!.env.example
+
+# Local tooling / IDE
+.vscode/
+.idea/
+*.swp
+
+# Version control & CI
+.git/
+.gitignore
+.github/
+
+# Generated docs / scratch
+docs_openapi.json
+*.sqlite3
+*.log
+
+# OS noise
+.DS_Store
+Thumbs.db

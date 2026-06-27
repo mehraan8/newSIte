@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.modules.identity.domain.entities import User
 from src.modules.identity.infrastructure.models import RefreshTokenModel, UserModel
+from src.shared_kernel.application.unit_of_work import Tracker
 from src.shared_kernel.domain.base import utcnow
 from src.shared_kernel.domain.value_objects import Mobile
 
@@ -26,16 +27,30 @@ def _to_domain(row: UserModel) -> User:
 
 
 class SqlUserRepository:
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, tracker: Tracker | None = None) -> None:
         self._s = session
+        self._tracker = tracker
+
+    def _track(self, user: User) -> None:
+        # Register the aggregate so the UoW can drain its events on commit.
+        if self._tracker is not None:
+            self._tracker.track(user)
 
     async def get_by_mobile(self, mobile: Mobile) -> User | None:
         row = await self._s.scalar(select(UserModel).where(UserModel.mobile == str(mobile)))
-        return _to_domain(row) if row else None
+        if row is None:
+            return None
+        user = _to_domain(row)
+        self._track(user)
+        return user
 
     async def get_by_id(self, user_id: uuid.UUID) -> User | None:
         row = await self._s.get(UserModel, user_id)
-        return _to_domain(row) if row else None
+        if row is None:
+            return None
+        user = _to_domain(row)
+        self._track(user)
+        return user
 
     async def add(self, user: User) -> None:
         self._s.add(
@@ -48,6 +63,7 @@ class SqlUserRepository:
                 is_phone_verified=user.is_phone_verified,
             )
         )
+        self._track(user)
         await self._s.flush()
 
     async def update(self, user: User) -> None:

@@ -10,6 +10,9 @@ _IR_MOBILE_RE = re.compile(r"^\+989\d{9}$")
 # Common local forms we normalize from: 09XXXXXXXXX, 9XXXXXXXXX, 00989...
 _LOCAL_PREFIXES = ("0098", "098", "98", "0")
 
+# URL slug: lowercase ascii words joined by single hyphens.
+_SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
 
 class InvalidMobileError(ValueError):
     pass
@@ -17,6 +20,24 @@ class InvalidMobileError(ValueError):
 
 class InvalidMoneyError(ValueError):
     pass
+
+
+class InvalidSlugError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class Slug:
+    value: str
+
+    def __post_init__(self) -> None:
+        if not _SLUG_RE.match(self.value):
+            raise InvalidSlugError(
+                f"invalid slug {self.value!r}: use lowercase a-z, 0-9, single hyphens"
+            )
+
+    def __str__(self) -> str:
+        return self.value
 
 
 @dataclass(frozen=True)

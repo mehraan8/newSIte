@@ -185,6 +185,77 @@ services:
     logging: *default-logging
 
   # ---------------------------------------------------------------------------
+  # Outbox relay — background worker, BOTH profiles.
+  #
+  # Drains outbox_messages and dispatches to consumers. Without it no event is
+  # ever delivered: projections never update and the checkout saga never
+  # advances past OrderPlaced. Not optional, and not part of the API process.
+  #
+  # SINGLE INSTANCE ONLY for now. Claims use FOR UPDATE SKIP LOCKED so extra
+  # replicas are safe, but OWN_UNIT_OF_WORK consumers commit outside the relay
+  # transaction (see outbox/dispatcher.py) and have not been load-tested
+  # concurrently. Scale only after that is verified.
+  # ---------------------------------------------------------------------------
+  relay:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: ecommerce-api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    profiles: ["prod", "dev"]
+    command: ["python", "-m", "src.shared_kernel.infrastructure.outbox.runner"]
+    environment:
+      <<: *app-env
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks: [backend]
+    logging: *default-logging
+    deploy:
+      replicas: 1
+      resources:
+        limits: { cpus: "1.0", memory: 512m }
+
+  # ---------------------------------------------------------------------------
+  # Inventory reservation TTL sweeper — background worker, BOTH profiles.
+  #
+  # Expires held reservations past their TTL and emits inventory.InventoryExpired
+  # so the checkout saga can release the order. Without it, held stock is never
+  # returned and an order whose hold lapsed still reaches payment — the ADR-0009
+  # D1 oversell path. Deploying the code without this service leaves that open.
+  #
+  # Safe to run multiple replicas (claims are FOR UPDATE SKIP LOCKED), but one is
+  # sufficient at current volume.
+  # ---------------------------------------------------------------------------
+  inventory-expiry:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: ecommerce-api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    profiles: ["prod", "dev"]
+    command: ["python", "-m", "src.modules.inventory.infrastructure.expiry_worker"]
+    environment:
+      <<: *app-env
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks: [backend]
+    logging: *default-logging
+    deploy:
+      replicas: 1
+      resources:
+        limits: { cpus: "0.5", memory: 256m }
+
+  # ---------------------------------------------------------------------------
   # pgAdmin — DEVELOPMENT only
   # ---------------------------------------------------------------------------
   pgadmin:

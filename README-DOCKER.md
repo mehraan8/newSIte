@@ -12,7 +12,42 @@ Production-grade orchestration for the FastAPI modular monolith.
 | `migrate` | built image | always | One-shot `alembic upgrade head`, then exits 0 |
 | `api` | built image | **prod** | Multi-worker Uvicorn, immutable image |
 | `api-dev` | built image | **dev** | Hot-reload Uvicorn, source bind-mounted |
+| `relay` | built image | prod + dev | **Outbox relay worker** — drains `outbox_messages`, dispatches to consumers |
+| `inventory-expiry` | built image | prod + dev | **Reservation TTL sweeper** — expires held stock, emits `inventory.InventoryExpired` |
 | `pgadmin` | dpage/pgadmin4:8 | **dev** | DB admin UI |
+
+### Background workers are not optional
+
+The API process only *writes* events to the outbox. Two separate processes make
+the system actually function, and running the API without them fails silently —
+requests return 200 while nothing downstream ever happens.
+
+**`relay`** — without it no event is ever delivered: BuyBox projections never
+update and the checkout saga never advances past `OrderPlaced`. Events simply
+accumulate unpublished.
+
+**`inventory-expiry`** — without it reservations never expire. Held stock is
+never returned, and an order whose hold has lapsed can still reach payment,
+which is the ADR-0009 D1 oversell path. Shipping the expiry *code* without this
+service leaves that hole open.
+
+Both are plain `python -m` entry points with no HTTP surface, so they have no
+health check. Monitor them by liveness plus these signals:
+
+| Signal | Query | Alarm when |
+|---|---|---|
+| Relay backlog | `count(*) from outbox_messages where not published_flag and available_at <= now()` | grows steadily |
+| Dead letters | `count(*) from dead_letter_messages` | any increase |
+| Expiry backlog | `count(*) from inventory_reservation where status='pending' and expires_at <= now()` | stays > 0 across passes |
+
+The expiry backlog alarm is the one that catches a stuck sweeper: a reservation
+the domain refuses to expire is skipped and left `pending` by design, so a
+persistent non-zero count means reconciliation is needed, not that the worker died.
+
+**Scaling.** `inventory-expiry` is safe to replicate (`FOR UPDATE SKIP LOCKED`
+claims). Keep `relay` at **one replica** for now — its claims are also skip-locked,
+but `OWN_UNIT_OF_WORK` consumers commit outside the relay transaction
+(`outbox/dispatcher.py`) and that path has not been load-tested concurrently.
 
 ---
 
@@ -114,6 +149,15 @@ docker compose run --rm migrate
 # Tail logs / status
 docker compose --profile dev logs -f api-dev
 docker compose ps
+
+# Background workers (start with either profile; verify BOTH are up)
+docker compose --profile prod logs -f relay
+docker compose --profile prod logs -f inventory-expiry
+
+# Run one expiry sweep by hand (debugging a backlog)
+docker compose run --rm inventory-expiry \
+  python -c "import asyncio; from src.modules.inventory.infrastructure.expiry_worker \
+import sweep_once; print(asyncio.run(sweep_once()))"
 
 # Tear down (keep data) / wipe volumes
 docker compose --profile dev down

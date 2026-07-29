@@ -34,16 +34,44 @@ class IncomingEvent:
     pii_refs: tuple[str, ...] = field(default_factory=tuple)
 
 
+class TransactionMode:
+    """How a consumer's DB work relates to the relay's transaction.
+
+    Both modes are legitimate and both are in use; what is NOT acceptable is
+    leaving it implicit, because the two give different delivery guarantees and a
+    reader cannot tell them apart from the handler signature.
+
+    RELAY_SESSION — the handler writes through the `session` it is handed. Its
+      writes, its inbox row and the outbox 'published' mark commit together, so
+      DB effects are exactly-once. The handler must NOT commit, and must NOT
+      publish events (it has no UoW to drain them into the outbox).
+
+    OWN_UNIT_OF_WORK — the handler ignores `session` and opens its own UoW. This
+      is required for any consumer that must EMIT events, because only a UoW
+      drains aggregates into the outbox in the same transaction as the state
+      change. The cost: that commit lands BEFORE the dispatcher records the inbox
+      row, so a crash in between replays the handler. Delivery is therefore
+      at-least-once and the handler MUST be internally idempotent — its own
+      business key, not the inbox, is what makes it safe.
+    """
+
+    RELAY_SESSION = "relay_session"
+    OWN_UNIT_OF_WORK = "own_unit_of_work"
+    ALL = frozenset({RELAY_SESSION, OWN_UNIT_OF_WORK})
+
+
 @runtime_checkable
 class EventHandler(Protocol):
     """A consumer. `name` is the stable inbox identity; `event_type` is what it
-    subscribes to. `handle` receives the SAME session as the relay tx, so its DB
-    writes commit atomically with the inbox record (exactly-once for DB effects).
-    External side effects (SMS, HTTP) are at-least-once — defer them via a new
-    outbox event instead of calling them inline."""
+    subscribes to; `transaction_mode` declares which transaction its writes join
+    (see TransactionMode — the registry rejects handlers that do not declare it).
+
+    External side effects (SMS, HTTP) are at-least-once in BOTH modes — defer
+    them via a new outbox event instead of calling them inline."""
 
     name: str
     event_type: str
+    transaction_mode: str
 
     async def handle(self, session: Any, event: IncomingEvent) -> None: ...
 

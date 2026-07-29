@@ -1,0 +1,5 @@
+# Test tooling. The DB-free projection/domain suites need nothing but pytest —
+# async tests are driven through asyncio.run in the test modules themselves, so
+# no pytest-asyncio dependency or event-loop mode config is required.
+-r requirements.txt
+pytest>=8.0

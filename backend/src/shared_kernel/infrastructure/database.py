@@ -26,6 +26,14 @@ class Base(DeclarativeBase):
     """
 
 
+if not settings.database_url:
+    raise RuntimeError(
+        "DATABASE_URL is not configured. It is derived from POSTGRES_USER / "
+        "POSTGRES_PASSWORD / POSTGRES_DB in the repo-root .env (see "
+        "src/config/env_bootstrap.py); set those, or export DATABASE_URL "
+        "explicitly."
+    )
+
 engine = create_async_engine(
     settings.database_url,
     echo=settings.db_echo,

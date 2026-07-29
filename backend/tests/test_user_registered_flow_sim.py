@@ -20,7 +20,10 @@ from src.modules.identity.domain.entities import User
 from src.modules.notification.application.consumers import UserRegisteredHandler
 from src.modules.notification.domain.entities import Notification
 from src.shared_kernel.domain.value_objects import Mobile
-from src.shared_kernel.infrastructure.outbox.contracts import IncomingEvent
+from src.shared_kernel.infrastructure.outbox.contracts import (
+    IncomingEvent,
+    TransactionMode,
+)
 from src.shared_kernel.infrastructure.outbox.dispatcher import EventDispatcher
 from src.shared_kernel.infrastructure.outbox.registry import HandlerRegistry
 from src.shared_kernel.infrastructure.outbox.retry import Backoff, on_failure
@@ -79,6 +82,9 @@ class FailingAfterWrite:
 
     name = "notification.on_user_registered"
     event_type = "identity.UserRegistered"
+    # Mirrors the real handler: writes through the relay session, never its own
+    # UoW. The registry rejects handlers that leave this undeclared.
+    transaction_mode = TransactionMode.RELAY_SESSION
 
     def __init__(self, repo_factory, fail_times: int = 1) -> None:
         self._rf = repo_factory

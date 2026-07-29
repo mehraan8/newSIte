@@ -55,3 +55,11 @@ class RateLimitedError(AppError):
     code = "rate_limited"
     http_status = 429
     message_fa = "تعداد درخواست‌ها بیش از حد مجاز است. لطفاً بعداً تلاش کنید."
+
+
+class ConcurrencyConflictError(AppError):
+    """Optimistic-lock / unique-violation conflict — caller should retry."""
+
+    code = "concurrency_conflict"
+    http_status = 409
+    message_fa = "تداخل همزمانی رخ داد. لطفاً دوباره تلاش کنید."

@@ -13,22 +13,47 @@ enable ``alembic revision --autogenerate``.
 from __future__ import annotations
 
 import os
+import sys
 from logging.config import fileConfig
+from pathlib import Path
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+# alembic.ini's prepend_sys_path is relative to the invocation CWD, so make
+# `src` importable from __file__ instead — this file is also driven
+# programmatically by the integration suite, from an arbitrary directory.
+BACKEND_ROOT = str(Path(__file__).resolve().parents[1])
+if BACKEND_ROOT not in sys.path:
+    sys.path.insert(0, BACKEND_ROOT)
+
+from src.config.env_bootstrap import load_env, sync_dsn  # noqa: E402
+
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers=False is required, not cosmetic. This module is
+    # also driven in-process by the integration suite; with the default (True)
+    # every logger created before `alembic upgrade` — i.e. the whole app — is
+    # switched off for the rest of the process, and any later test asserting on
+    # captured log output sees an empty string.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
-# Resolve the DB URL at runtime (env var wins over alembic.ini).
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+psycopg://app:app@localhost:5432/ecommerce",
-)
-config.set_main_option("sqlalchemy.url", DATABASE_URL)
+# Resolve the DB URL at runtime (a real env var wins over the .env layers).
+# No hardcoded fallback: a missing DATABASE_URL must fail loudly rather than
+# quietly dial a guessed password against some other database.
+load_env()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is not set. It is derived from POSTGRES_USER / "
+        "POSTGRES_PASSWORD / POSTGRES_DB in the repo-root .env (see "
+        "src/config/env_bootstrap.py); set those, or export DATABASE_URL."
+    )
+
+# Alembic is synchronous: accept an asyncpg URL and swap the driver rather than
+# making every caller remember to pass the psycopg form.
+config.set_main_option("sqlalchemy.url", sync_dsn(DATABASE_URL))
 
 # Hand-written migrations for the baseline; wire models here later.
 target_metadata = None

@@ -17,7 +17,7 @@ from src.modules.notification.domain.entities import (
     NotificationChannel,
     NotificationStatus,
 )
-from src.shared_kernel.infrastructure.outbox.contracts import IncomingEvent
+from src.shared_kernel.infrastructure.outbox.contracts import IncomingEvent, TransactionMode
 
 
 def _default_repo_factory(session: Any):
@@ -31,6 +31,7 @@ def _default_repo_factory(session: Any):
 class UserRegisteredHandler:
     name = "notification.on_user_registered"        # stable inbox identity
     event_type = "identity.UserRegistered"          # subscription
+    transaction_mode = TransactionMode.RELAY_SESSION
 
     def __init__(self, repo_factory: Callable[[Any], Any] | None = None) -> None:
         self._repo_factory = repo_factory or _default_repo_factory

@@ -72,26 +72,38 @@ class Mobile:
 
 @dataclass(frozen=True)
 class Money:
-    """Iranian Rial is integer-only — no minor units."""
+    """Multi-currency money as integer minor units + ISO-4217 currency + scale.
+
+    `amount` is in MINOR units; `scale` is the number of decimal places.
+      IRR -> scale 0 (amount is rials)   USD -> scale 2 (amount is cents)
+    Arithmetic requires identical currency AND scale — no implicit FX.
+    """
 
     amount: int
     currency: str = "IRR"
+    scale: int = 0
 
     def __post_init__(self) -> None:
         if self.amount < 0:
             raise InvalidMoneyError("amount cannot be negative")
+        if self.scale < 0:
+            raise InvalidMoneyError("scale cannot be negative")
+        if len(self.currency) != 3:
+            raise InvalidMoneyError("currency must be a 3-letter ISO-4217 code")
 
     def __add__(self, other: "Money") -> "Money":
-        self._assert_same_currency(other)
-        return Money(self.amount + other.amount, self.currency)
+        self._assert_compatible(other)
+        return Money(self.amount + other.amount, self.currency, self.scale)
 
     def __sub__(self, other: "Money") -> "Money":
-        self._assert_same_currency(other)
-        return Money(self.amount - other.amount, self.currency)
+        self._assert_compatible(other)
+        return Money(self.amount - other.amount, self.currency, self.scale)
 
     def __mul__(self, qty: int) -> "Money":
-        return Money(self.amount * qty, self.currency)
+        return Money(self.amount * qty, self.currency, self.scale)
 
-    def _assert_same_currency(self, other: "Money") -> None:
-        if self.currency != other.currency:
-            raise InvalidMoneyError("currency mismatch")
+    def _assert_compatible(self, other: "Money") -> None:
+        if self.currency != other.currency or self.scale != other.scale:
+            raise InvalidMoneyError(
+                f"money mismatch: {self.currency}/{self.scale} vs {other.currency}/{other.scale}"
+            )

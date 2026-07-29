@@ -14,6 +14,8 @@ last_error) belong to the relay, not the producer; the UoW writes the defaults.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import uuid
 from datetime import datetime
 
@@ -46,9 +48,9 @@ class OutboxMessage(Base):
     event_type: Mapped[str] = mapped_column(String(160), nullable=False)
     event_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("1"))
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    correlation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
-    causation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
-    tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    correlation_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
+    causation_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
+    tenant_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
     region: Mapped[str] = mapped_column(String(20), nullable=False, server_default=text("'global'"))
     pii_refs: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
 
@@ -61,8 +63,8 @@ class OutboxMessage(Base):
     available_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("now()")
     )
-    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    last_error: Mapped[str | None] = mapped_column(Text)
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("now()")
     )
@@ -110,8 +112,8 @@ class DeadLetterMessage(Base):
     event_type: Mapped[str] = mapped_column(String(160), nullable=False)
     event_version: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    correlation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
-    tenant_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    correlation_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
+    tenant_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
     region: Mapped[str] = mapped_column(String(20), nullable=False)
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
     error: Mapped[str] = mapped_column(Text, nullable=False)

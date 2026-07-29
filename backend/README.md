@@ -28,17 +28,24 @@ by creating a module and registering its router in `src/api/v1/router.py`.
 
 ## Run
 
+Credentials come from the **repo-root `.env`** — the same file `docker compose`
+reads. `src/config/env_bootstrap.py` derives `DATABASE_URL`, `TEST_DATABASE_URL`
+and `REDIS_URL` from `POSTGRES_*` / `REDIS_*`, so there is no DSN to keep in sync
+and no `$env:DATABASE_URL` to export.
+
 ```powershell
 cd backend
 python -m pip install -r requirements.txt
-Copy-Item .env.example .env     # then edit secrets
+Copy-Item .env.example .env     # host-side overrides only; no secrets
 
-# 1) migrate (Alembic uses the sync psycopg URL)
-$env:DATABASE_URL = "postgresql+psycopg://app:app@localhost:5432/ecommerce"
+# 1) migrate (env.py swaps asyncpg -> psycopg on its own)
 alembic upgrade head
 
-# 2) run the API (app uses the async asyncpg URL from .env)
+# 2) run the API
 uvicorn src.api.main:app --reload
+
+# 3) tests — the scratch DB (<POSTGRES_DB>_test) is created automatically
+python -m pytest tests/integration -vv
 ```
 
 - Swagger UI: http://localhost:8000/docs

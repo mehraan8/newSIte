@@ -11,6 +11,7 @@ Run as its own process (separate from the API):
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from src.shared_kernel.infrastructure.outbox.dispatcher import (
     EventDispatcher,
@@ -29,8 +30,34 @@ def build_registry() -> HandlerRegistry:
     registry = HandlerRegistry()
     # --- consumer registrations (the Published Language wiring) ---
     from src.modules.notification.application.consumers import UserRegisteredHandler
+    from src.modules.buybox.application.consumers import BUYBOX_HANDLERS
 
     registry.register(UserRegisteredHandler())
+    for buybox_handler in BUYBOX_HANDLERS:
+        registry.register(buybox_handler())
+
+    # --- checkout saga wiring (Ordering orchestrates via events) ---
+    from src.modules.inventory.application.consumers import (
+        OnInventoryCommitRequested,
+        OnInventoryReleaseRequested,
+        OnOrderReservationRequested,
+    )
+    from src.modules.ordering.interface.consumers import (
+        OnInventoryExpired,
+        OnInventoryReservationFailed,
+        OnInventoryReserved,
+        PaymentStubOnPaymentRequested,
+    )
+
+    # Inventory reacts to Ordering commands (performs its own mutations):
+    registry.register(OnOrderReservationRequested())
+    registry.register(OnInventoryCommitRequested())
+    registry.register(OnInventoryReleaseRequested())
+    # Ordering saga reacts to Inventory replies + (stub) payment:
+    registry.register(OnInventoryReserved())
+    registry.register(OnInventoryReservationFailed())
+    registry.register(OnInventoryExpired())
+    registry.register(PaymentStubOnPaymentRequested())
     return registry
 
 
@@ -53,4 +80,10 @@ async def _main() -> None:
 
 
 if __name__ == "__main__":
+    # See expiry_worker: without this the relay's failures are untimestamped and
+    # anything below WARNING is dropped entirely.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)-8s %(name)s %(message)s",
+    )
     asyncio.run(_main())

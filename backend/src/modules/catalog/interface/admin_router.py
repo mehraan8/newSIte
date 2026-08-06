@@ -1,8 +1,10 @@
 """Catalog write (admin) endpoints.
 
 Composition root for the write side: builds use cases over the Catalog UoW
-factory. No Identity import here — these routes are intended to sit behind the
-gateway's admin RBAC, so Catalog stays independently extractable.
+factory. These routes were previously left open on the assumption that a gateway
+would enforce admin RBAC; no such gateway exists in this deployment, so
+authentication is enforced here with the application's own bearer-token
+dependency. The coupling is limited to that single dependency.
 """
 
 from __future__ import annotations
@@ -10,6 +12,8 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, status
+
+from src.modules.identity.interface.dependencies import get_current_user
 
 from src.modules.catalog.application.write_dtos import (
     CreateProductCommand,
@@ -24,7 +28,12 @@ from src.modules.catalog.interface.admin_schemas import (
     UpdateProductRequest,
 )
 
-router = APIRouter(prefix="/catalog/admin", tags=["catalog-admin"])
+router = APIRouter(
+    prefix="/catalog/admin",
+    tags=["catalog-admin"],
+    # Authentication is mandatory for every route on this router.
+    dependencies=[Depends(get_current_user)],
+)
 
 
 def get_create_product() -> CreateProduct:

@@ -16,7 +16,11 @@ from src.modules.catalog.application.write_dtos import (
     UpdateProductCommand,
 )
 from src.modules.catalog.domain.entities import Product
-from src.shared_kernel.application.errors import ConflictError, NotFoundError
+from src.shared_kernel.application.errors import (
+    ConflictError,
+    NotFoundError,
+    ValidationError,
+)
 
 UowFactory = Callable[[], CatalogUnitOfWork]
 
@@ -31,19 +35,27 @@ class CreateProduct:
             if await uow.products.get_by_slug(cmd.slug) is not None:
                 raise ConflictError("محصولی با این نامک از قبل وجود دارد.")
 
-            product = Product.create(
-                product_type_id=cmd.product_type_id,
-                category_id=cmd.category_id,
-                slug=cmd.slug,
-                name_fa=cmd.name_fa,
-                brand_id=cmd.brand_id,
-                description=cmd.description,
-                is_featured=cmd.is_featured,
-            )
-            for v in cmd.variants:
-                product.add_variant(
-                    v.sku, variant_axis_values=v.variant_axis_values, barcode=v.barcode
+            # The Product aggregate signals malformed input with plain ValueError
+            # (invalid slug, blank name_fa, blank/duplicate sku). Translate it to a
+            # transport-mappable application error HERE, at the boundary, exactly as
+            # Selling does for SellingDomainError — otherwise it reaches the
+            # catch-all handler and a bad request is reported as a 500.
+            try:
+                product = Product.create(
+                    product_type_id=cmd.product_type_id,
+                    category_id=cmd.category_id,
+                    slug=cmd.slug,
+                    name_fa=cmd.name_fa,
+                    brand_id=cmd.brand_id,
+                    description=cmd.description,
+                    is_featured=cmd.is_featured,
                 )
+                for v in cmd.variants:
+                    product.add_variant(
+                        v.sku, variant_axis_values=v.variant_axis_values, barcode=v.barcode
+                    )
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from exc
 
             await uow.products.add(product)
             await uow.commit()      # state + ProductCreated outbox row, atomic
@@ -61,15 +73,20 @@ class UpdateProduct:
             if product is None:
                 raise NotFoundError("محصول یافت نشد.")
 
-            product.update_details(
-                name_fa=cmd.name_fa,
-                description=cmd.description,
-                brand_id=cmd.brand_id,
-                category_id=cmd.category_id,
-                is_featured=cmd.is_featured,
-            )
-            if cmd.status is not None:
-                product.change_status(cmd.status)
+            # Same boundary translation as CreateProduct: blank name_fa and an
+            # invalid status value are caller errors, not server faults.
+            try:
+                product.update_details(
+                    name_fa=cmd.name_fa,
+                    description=cmd.description,
+                    brand_id=cmd.brand_id,
+                    category_id=cmd.category_id,
+                    is_featured=cmd.is_featured,
+                )
+                if cmd.status is not None:
+                    product.change_status(cmd.status)
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from exc
 
             await uow.products.save(product)
             await uow.commit()      # state + ProductUpdated outbox row, atomic

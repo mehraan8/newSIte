@@ -1,4 +1,8 @@
-"""Selling endpoints (seller-facing; sit behind gateway RBAC)."""
+"""Selling endpoints (seller-facing).
+
+Authentication is enforced here rather than delegated to a gateway: no gateway
+exists in this deployment, and these routes create offers and set prices.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +10,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, status
 
+from src.modules.identity.interface.dependencies import CurrentUser, get_current_user
 from src.modules.selling.application.dtos import (
     ChangeOfferPriceCommand,
     CreateOfferCommand,
@@ -25,7 +30,12 @@ from src.modules.selling.interface.schemas import (
     OfferResponse,
 )
 
-router = APIRouter(prefix="/selling", tags=["selling"])
+router = APIRouter(
+    prefix="/selling",
+    tags=["selling"],
+    # Authentication is mandatory for every route on this router.
+    dependencies=[Depends(get_current_user)],
+)
 
 
 def get_create_offer() -> CreateOffer:
@@ -51,11 +61,15 @@ def get_change_price() -> ChangeOfferPrice:
 
 @router.post("/offers", response_model=OfferResponse, status_code=status.HTTP_201_CREATED)
 async def create_offer(
-    body: CreateOfferRequest, uc: CreateOffer = Depends(get_create_offer)
+    body: CreateOfferRequest,
+    uc: CreateOffer = Depends(get_create_offer),
+    current: CurrentUser = Depends(get_current_user),
 ) -> OfferResponse:
     cmd = CreateOfferCommand(
-        seller_id=body.seller_id,
-        variant_id=body.variant_id,
+        # Authenticated principal — NOT a request field. A body-supplied
+        # seller_id is rejected by the schema (extra="forbid").
+        seller_id=str(current.id),
+        variant_id=str(body.variant_id),
         condition=body.condition,
         currency=body.currency,
         amount=body.amount,

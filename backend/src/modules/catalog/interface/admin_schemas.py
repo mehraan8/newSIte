@@ -2,35 +2,47 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from src.modules.catalog.application.write_dtos import ProductView
 
 
+# Lengths mirror the database columns (products.slug varchar(200),
+# products.name_fa varchar(255), product_variants.sku/barcode), so an oversized
+# value is a 422 from the schema instead of a StringDataRightTruncationError
+# raised at flush time and surfaced as a 500. Positive-int constraints likewise
+# reject ids that could never satisfy the foreign keys.
+_SLUG_PATTERN = r"^[a-z0-9]+(?:-[a-z0-9]+)*$"
+
+
 class VariantRequest(BaseModel):
-    sku: str
+    sku: str = Field(min_length=1, max_length=64)
     variant_axis_values: dict = Field(default_factory=dict)
-    barcode: str | None = None
+    barcode: str | None = Field(default=None, max_length=64)
 
 
 class CreateProductRequest(BaseModel):
-    product_type_id: int
-    category_id: int
-    slug: str
-    name_fa: str
-    brand_id: int | None = None
+    product_type_id: int = Field(ge=1)
+    category_id: int = Field(ge=1)
+    # Pattern mirrors the Slug value object, which raises InvalidSlugError.
+    slug: str = Field(min_length=1, max_length=200, pattern=_SLUG_PATTERN)
+    name_fa: str = Field(min_length=1, max_length=255)
+    brand_id: int | None = Field(default=None, ge=1)
     description: str | None = None
     is_featured: bool = False
-    variants: list[VariantRequest] = Field(default_factory=list)
+    variants: list[VariantRequest] = Field(default_factory=list, max_length=200)
 
 
 class UpdateProductRequest(BaseModel):
-    name_fa: str | None = None
+    name_fa: str | None = Field(default=None, min_length=1, max_length=255)
     description: str | None = None
-    brand_id: int | None = None
-    category_id: int | None = None
+    brand_id: int | None = Field(default=None, ge=1)
+    category_id: int | None = Field(default=None, ge=1)
     is_featured: bool | None = None
-    status: str | None = None
+    # Mirrors ProductStatus.ALL, which the aggregate enforces with a ValueError.
+    status: Literal["draft", "active", "archived"] | None = None
 
 
 class VariantResponse(BaseModel):

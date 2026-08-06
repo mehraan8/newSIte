@@ -27,12 +27,24 @@ router = APIRouter(prefix="/orders", tags=["ordering"])
 # extra="forbid" on both: a client that still sends `unit_amount` or
 # `customer_id` gets a 422 instead of having it silently ignored. Silent
 # ignoring hides an attempted bypass; rejecting surfaces it.
+# Abuse limits. These bound the request, not the business rules: a legitimate
+# basket is far below them. Without a ceiling a single call could open hundreds of
+# reservations, drain a variant's stock and fail every concurrent shopper's
+# checkout — observed in the audit, where one 500-line request exhausted stock and
+# failed six unrelated orders.
+MAX_ORDER_LINES = 50
+MAX_LINE_QUANTITY = 100
+MAX_IDEMPOTENCY_KEY_LENGTH = 255
+
+
 class LineBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    offer_id: str
-    location: str = "default"
-    quantity: int = Field(gt=0)
+    # UUID-typed: a malformed offer_id is a 422 from the schema instead of a
+    # ValueError inside the use case (previously a 500). Wire format unchanged.
+    offer_id: uuid.UUID
+    location: str = Field(default="default", min_length=1, max_length=64)
+    quantity: int = Field(gt=0, le=MAX_LINE_QUANTITY)
 
 
 class CheckoutBody(BaseModel):
@@ -41,9 +53,9 @@ class CheckoutBody(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    region: str = "global"
-    currency: str = "IRR"
-    lines: list[LineBody] = Field(min_length=1)
+    region: str = Field(default="global", min_length=1, max_length=64)
+    currency: str = Field(default="IRR", min_length=3, max_length=3)
+    lines: list[LineBody] = Field(min_length=1, max_length=MAX_ORDER_LINES)
 
 
 def get_cancel_order() -> CancelOrder:
@@ -62,7 +74,9 @@ async def checkout(
     body: CheckoutBody,
     uc: PlaceOrder = Depends(get_place_order),
     current: CurrentUser = Depends(get_current_user),
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: str | None = Header(
+        default=None, alias="Idempotency-Key", max_length=MAX_IDEMPOTENCY_KEY_LENGTH
+    ),
 ):
     """Send an Idempotency-Key to make a retry safe: the same key returns the
     original order instead of placing a second one.
@@ -77,7 +91,7 @@ async def checkout(
         region=body.region,
         currency=body.currency,
         lines=tuple(
-            OrderLineInput(offer_id=li.offer_id, location=li.location,
+            OrderLineInput(offer_id=str(li.offer_id), location=li.location,
                            quantity=li.quantity)
             for li in body.lines
         ),

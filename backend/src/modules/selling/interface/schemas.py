@@ -2,26 +2,38 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+import uuid
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.modules.selling.application.dtos import OfferView
 
 
 class CreateOfferRequest(BaseModel):
-    seller_id: str
-    variant_id: str
+    """No seller_id: it comes from the bearer token, exactly as Ordering derives
+    customer_id. extra="forbid" so a client still sending `seller_id` gets a 422
+    instead of having it silently ignored — silent ignoring hides an attempted
+    impersonation, rejecting surfaces it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # UUID-typed: a malformed id is a 422 from the schema rather than a ValueError
+    # from uuid.UUID() inside the use case (previously a 500). Wire format unchanged.
+    variant_id: uuid.UUID
     condition: str = "new"
-    currency: str = "IRR"
-    amount: int | None = Field(default=None, description="price in minor units")
-    scale: int = 0
-    compare_at_amount: int | None = None
+    # Money constraints mirror the Money value object, which rejects a negative
+    # amount, a negative scale and a currency that is not 3 characters.
+    currency: str = Field(default="IRR", min_length=3, max_length=3)
+    amount: int | None = Field(default=None, ge=0, description="price in minor units")
+    scale: int = Field(default=0, ge=0, le=8)
+    compare_at_amount: int | None = Field(default=None, ge=0)
 
 
 class ChangeOfferPriceRequest(BaseModel):
-    amount: int
-    currency: str = "IRR"
-    scale: int = 0
-    compare_at_amount: int | None = None
+    amount: int = Field(ge=0)
+    currency: str = Field(default="IRR", min_length=3, max_length=3)
+    scale: int = Field(default=0, ge=0, le=8)
+    compare_at_amount: int | None = Field(default=None, ge=0)
 
 
 class PriceResponse(BaseModel):

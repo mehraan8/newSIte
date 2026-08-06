@@ -133,3 +133,11 @@ class SqlRefreshTokenStore:
             .where(RefreshTokenModel.family_id == family_id, RefreshTokenModel.revoked_at.is_(None))
             .values(revoked_at=utcnow())
         )
+        # Commit HERE, not at the end of the request. Reuse detection revokes the
+        # family and then raises UnauthorizedError; the request-scoped session
+        # (see shared_kernel/infrastructure/database.py:get_session) rolls back on
+        # any exception, which silently discarded this revocation and left the
+        # stolen family fully usable. This is the only write in that code path, so
+        # committing it here makes the security guarantee real without affecting
+        # anything else staged on the session.
+        await self._s.commit()

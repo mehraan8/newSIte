@@ -32,6 +32,7 @@ from src.shared_kernel.application.errors import (
     ConcurrencyConflictError,
     ConflictError,
     NotFoundError,
+    ValidationError,
 )
 from src.shared_kernel.domain.base import utcnow
 
@@ -75,13 +76,19 @@ class ReceiveStock:
             uow = self._uow_factory()
             async with uow:
                 item = await uow.inventory.get_item(offer_id, cmd.location)
-                if item is None:
-                    item = InventoryItem.create(offer_id=offer_id, location=cmd.location)
-                    item.receive(cmd.quantity)
-                    await uow.inventory.add_item(item)
-                else:
-                    item.receive(cmd.quantity)
-                    await uow.inventory.save_item(item)
+                # receive() rejects a non-positive quantity with InventoryDomainError.
+                # Translate it here, as ReserveStock already does, so a bad quantity
+                # is a 422 instead of reaching the catch-all handler as a 500.
+                try:
+                    if item is None:
+                        item = InventoryItem.create(offer_id=offer_id, location=cmd.location)
+                        item.receive(cmd.quantity)
+                        await uow.inventory.add_item(item)
+                    else:
+                        item.receive(cmd.quantity)
+                        await uow.inventory.save_item(item)
+                except InventoryDomainError as exc:
+                    raise ValidationError(exc.message_fa) from exc
                 await uow.commit()
             return StockView.from_domain(item)
 

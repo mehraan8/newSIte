@@ -17,10 +17,8 @@ from src.modules.identity.application.use_cases import (
 )
 from src.modules.identity.infrastructure.jwt_service import JwtTokenService
 from src.modules.identity.infrastructure.otp_store import RedisOtpStore
-from src.modules.identity.infrastructure.repository import (
-    SqlRefreshTokenStore,
-    SqlUserRepository,
-)
+from src.modules.identity.infrastructure.repository import SqlRefreshTokenStore
+from src.modules.identity.infrastructure.unit_of_work import SqlAlchemyIdentityUnitOfWork
 from src.modules.identity.infrastructure.sms_sender import (
     ConsoleOtpSender,
     KavenegarOtpSender,
@@ -41,12 +39,14 @@ def get_request_otp() -> RequestOtp:
     return RequestOtp(otp_store=RedisOtpStore(get_redis()), sender=_sender())
 
 
-def get_verify_otp(session: AsyncSession = Depends(get_session)) -> VerifyOtp:
+def get_verify_otp() -> VerifyOtp:
+    # Owns its own transaction via the Identity UoW, so the User aggregate is
+    # tracked and its events reach the outbox atomically with the user row.
+    # No request session is injected: the UoW opens and commits its own.
     return VerifyOtp(
         otp_store=RedisOtpStore(get_redis()),
-        users=SqlUserRepository(session),
         tokens=JwtTokenService(),
-        refresh_store=SqlRefreshTokenStore(session),
+        uow_factory=SqlAlchemyIdentityUnitOfWork,
     )
 
 
@@ -76,4 +76,11 @@ async def get_current_user(authorization: str = Header(default="")) -> CurrentUs
         raise UnauthorizedError("توکن نامعتبر است.") from exc
     if payload.get("type") != "access":
         raise UnauthorizedError("نوع توکن نامعتبر است.")
-    return CurrentUser(uuid.UUID(payload["sub"]), payload.get("roles", []))
+    # A token whose `sub` is missing or not a UUID is a malformed credential, not
+    # a server fault: uuid.UUID() raised ValueError/KeyError here and the caller
+    # got a 500 instead of a 401.
+    try:
+        user_id = uuid.UUID(payload["sub"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise UnauthorizedError("توکن نامعتبر است.") from exc
+    return CurrentUser(user_id, payload.get("roles", []))

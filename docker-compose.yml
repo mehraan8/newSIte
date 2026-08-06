@@ -135,6 +135,14 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      # Bringing up the API explicitly (`up -d api` / `up -d api-dev`) must also
+      # bring up the workers: without the relay no event is ever delivered and
+      # checkout cannot complete, and without the sweeper expired holds are never
+      # returned. service_started (not _healthy) because workers serve no HTTP.
+      relay:
+        condition: service_started
+      inventory-expiry:
+        condition: service_started
     networks: [backend]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=4).status==200 else 1)"]
@@ -175,6 +183,14 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      # Bringing up the API explicitly (`up -d api` / `up -d api-dev`) must also
+      # bring up the workers: without the relay no event is ever delivered and
+      # checkout cannot complete, and without the sweeper expired holds are never
+      # returned. service_started (not _healthy) because workers serve no HTTP.
+      relay:
+        condition: service_started
+      inventory-expiry:
+        condition: service_started
     networks: [backend]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=4).status==200 else 1)"]
@@ -185,7 +201,7 @@ services:
     logging: *default-logging
 
   # ---------------------------------------------------------------------------
-  # Outbox relay — background worker, BOTH profiles.
+  # Outbox relay — background worker, ALWAYS started (no profile).
   #
   # Drains outbox_messages and dispatches to consumers. Without it no event is
   # ever delivered: projections never update and the checkout saga never
@@ -202,7 +218,11 @@ services:
       dockerfile: Dockerfile
     image: ecommerce-api:${IMAGE_TAG:-latest}
     restart: unless-stopped
-    profiles: ["prod", "dev"]
+    # Deliberately NO `profiles`: a service with no profile is always part of the
+    # default set, so `docker compose up`, `--profile dev up` and `--profile prod
+    # up` all start it. It was previously gated on ["prod","dev"], which meant a
+    # startup that named services explicitly (e.g. `up -d api`) silently left the
+    # relay down — and with it, every projection and the whole checkout saga.
     command: ["python", "-m", "src.shared_kernel.infrastructure.outbox.runner"]
     environment:
       <<: *app-env
@@ -215,6 +235,11 @@ services:
       migrate:
         condition: service_completed_successfully
     networks: [backend]
+    # The image's HEALTHCHECK probes the API on :8000, which a worker does not
+    # serve — inherited unchanged it pins these containers to "unhealthy" and
+    # masks real failures. Workers have no HTTP surface to probe.
+    healthcheck:
+      disable: true
     logging: *default-logging
     deploy:
       replicas: 1
@@ -222,7 +247,7 @@ services:
         limits: { cpus: "1.0", memory: 512m }
 
   # ---------------------------------------------------------------------------
-  # Inventory reservation TTL sweeper — background worker, BOTH profiles.
+  # Inventory reservation TTL sweeper — background worker, ALWAYS started.
   #
   # Expires held reservations past their TTL and emits inventory.InventoryExpired
   # so the checkout saga can release the order. Without it, held stock is never
@@ -238,7 +263,7 @@ services:
       dockerfile: Dockerfile
     image: ecommerce-api:${IMAGE_TAG:-latest}
     restart: unless-stopped
-    profiles: ["prod", "dev"]
+    # Deliberately NO `profiles` — see the relay above for the reasoning.
     command: ["python", "-m", "src.modules.inventory.infrastructure.expiry_worker"]
     environment:
       <<: *app-env
@@ -249,6 +274,11 @@ services:
       migrate:
         condition: service_completed_successfully
     networks: [backend]
+    # The image's HEALTHCHECK probes the API on :8000, which a worker does not
+    # serve — inherited unchanged it pins these containers to "unhealthy" and
+    # masks real failures. Workers have no HTTP surface to probe.
+    healthcheck:
+      disable: true
     logging: *default-logging
     deploy:
       replicas: 1

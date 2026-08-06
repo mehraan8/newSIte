@@ -10,8 +10,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+from typing import Callable
 
 from src.config.settings import settings
+from src.modules.identity.application.unit_of_work import IdentityUnitOfWork
 from src.modules.identity.application.dtos import (
     AuthResult,
     AuthTokens,
@@ -22,7 +24,6 @@ from src.modules.identity.application.ports import (
     OtpStore,
     RefreshTokenStore,
     TokenService,
-    UserRepository,
 )
 from src.modules.identity.domain.entities import User
 from src.modules.identity.domain.exceptions import UserBlockedError
@@ -33,6 +34,8 @@ from src.shared_kernel.application.errors import (
 )
 from src.shared_kernel.domain.base import new_uuid
 from src.shared_kernel.domain.value_objects import Mobile
+
+UowFactory = Callable[[], IdentityUnitOfWork]
 
 
 def _hash_code(code: str) -> str:
@@ -71,17 +74,24 @@ class RequestOtp:
 
 
 class VerifyOtp:
+    """Runs the login write inside the Identity Unit of Work.
+
+    The UoW is what drains the User aggregate's events (UserRegistered /
+    UserLoggedIn) into the outbox in the SAME transaction as the user row. This
+    use case previously took a bare repository on the request session, so nothing
+    ever collected those events: they were recorded on the aggregate and dropped,
+    and the registered notification consumer had no producer.
+    """
+
     def __init__(
         self,
         otp_store: OtpStore,
-        users: UserRepository,
         tokens: TokenService,
-        refresh_store: RefreshTokenStore,
+        uow_factory: "UowFactory",
     ) -> None:
         self._store = otp_store
-        self._users = users
         self._tokens = tokens
-        self._refresh = refresh_store
+        self._uow_factory = uow_factory
 
     async def execute(self, raw_mobile: str, code: str) -> AuthResult:
         mobile = Mobile.parse(raw_mobile)
@@ -100,20 +110,26 @@ class VerifyOtp:
 
         await self._store.delete(mobile)  # single-use
 
-        user = await self._users.get_by_mobile(mobile)
-        is_new = user is None
-        if user is None:
-            user = User.register(mobile)
-            await self._users.add(user)
-        # Domain raises a pure domain error; translate it to a transport-mappable
-        # application error here, at the boundary (domain stays HTTP-agnostic).
-        try:
-            user.mark_logged_in()
-        except UserBlockedError as exc:
-            raise ForbiddenError(exc.message_fa) from exc
-        await self._users.update(user)
+        uow = self._uow_factory()
+        async with uow:
+            user = await uow.users.get_by_mobile(mobile)
+            is_new = user is None
+            if user is None:
+                user = User.register(mobile)
+                await uow.users.add(user)
+            # Domain raises a pure domain error; translate it to a transport-mappable
+            # application error here, at the boundary (domain stays HTTP-agnostic).
+            try:
+                user.mark_logged_in()
+            except UserBlockedError as exc:
+                raise ForbiddenError(exc.message_fa) from exc
+            await uow.users.update(user)
 
-        tokens = await self._issue_tokens(user)
+            tokens = await self._issue_tokens(uow, user)
+            # One atomic commit: the user row, the refresh token, and the
+            # UserRegistered/UserLoggedIn outbox rows land together.
+            await uow.commit()
+
         return AuthResult(
             user_id=str(user.id),
             mobile=str(user.mobile),
@@ -121,11 +137,11 @@ class VerifyOtp:
             tokens=tokens,
         )
 
-    async def _issue_tokens(self, user: User) -> AuthTokens:
+    async def _issue_tokens(self, uow, user: User) -> AuthTokens:
         family_id = new_uuid()
         access = self._tokens.create_access_token(user.id, roles=[])
         raw_refresh, refresh_hash = self._tokens.create_refresh_token(user.id, family_id)
-        await self._refresh.save(
+        await uow.refresh_tokens.save(
             user.id, refresh_hash, family_id, settings.refresh_token_ttl_seconds
         )
         return AuthTokens(access_token=access, refresh_token=raw_refresh)

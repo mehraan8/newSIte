@@ -29,6 +29,12 @@ from src.shared_kernel.infrastructure.outbox.stores import (
 def build_registry() -> HandlerRegistry:
     registry = HandlerRegistry()
     # --- consumer registrations (the Published Language wiring) ---
+    # NotificationModel declares a FK to Identity's `users` table. SQLAlchemy
+    # resolves that target from the shared MetaData at mapper-configuration time,
+    # so Identity's models must be imported in this process or the first insert
+    # fails with NoReferencedTableError. The API process imports them via the auth
+    # routes; the relay runs standalone and does not.
+    from src.modules.identity.infrastructure import models as _identity_models  # noqa: F401
     from src.modules.notification.application.consumers import UserRegisteredHandler
     from src.modules.buybox.application.consumers import BUYBOX_HANDLERS
 

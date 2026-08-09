@@ -1,0 +1,87 @@
+# Minimal CI (ADR-0010 Rev 4, Phase 0 prerequisite).
+#
+# Three steps, deliberately no more: install, type check, test. The repository
+# had no CI at all, which is how ten unauthenticated write endpoints and a
+# deleted authorization test package both went unnoticed.
+#
+# Postgres is provided as a service because the integration and API suites are
+# skipped without it — and a skipped authorization suite is indistinguishable
+# from a passing one, which is the exact failure mode this pipeline exists to
+# prevent. TEST_DATABASE_URL points at a scratch database that the suite
+# truncates freely; it is created fresh by the service container on every run,
+# so it can never be stamped at a stale Alembic revision.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: ecommerce
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U app"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Consumed by src/config/env_bootstrap.py exactly as it is locally.
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: ecommerce
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      DATABASE_URL: postgresql+asyncpg://app:app@localhost:5432/ecommerce
+      TEST_DATABASE_URL: postgresql+asyncpg://app:app@localhost:5432/ecommerce_test
+      REDIS_URL: redis://localhost:6379/0
+      JWT_SECRET: ci-only-not-a-real-secret-0123456789abcdef
+      OTP_PEPPER: ci-only-not-a-real-pepper-0123456789abcdef
+      ENVIRONMENT: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Type check
+        run: python -m mypy
+
+      - name: Test
+        run: python -m pytest

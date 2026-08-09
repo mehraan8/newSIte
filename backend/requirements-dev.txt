@@ -3,3 +3,10 @@
 # no pytest-asyncio dependency or event-loop mode config is required.
 -r requirements.txt
 pytest>=8.0
+
+# Static type checking (ADR-0010 Rev 4, Phase 0 prerequisite). Scope and the
+# incremental-adoption strategy are documented in mypy.ini. mypy was chosen over
+# pyright because it installs from this file like every other tool here; pyright
+# would add a Node toolchain to a pure-Python project. No linter is introduced:
+# the prerequisite is type checker + tests + CI.
+mypy>=1.11

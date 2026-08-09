@@ -193,6 +193,9 @@ _MODEL_MODULES = (
     "src.modules.inventory.infrastructure.models",
     "src.modules.ordering.infrastructure.models",
     "src.modules.buybox.infrastructure.models",
+    # merchant resolves under create_all: its only FK (seller_members ->
+    # sellers) is internal to the context, unlike notification's FK to Identity.
+    "src.modules.merchant.infrastructure.models",
     # notification.models is deliberately excluded: it FKs to Identity's `users`,
     # which is migration-only (no ORM model), so create_all cannot resolve it.
     # No validation here touches notifications.

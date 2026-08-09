@@ -22,6 +22,7 @@ from src.modules.identity.application.dtos import (
 from src.modules.identity.application.ports import (
     OtpSender,
     OtpStore,
+    PlatformRoleQuery,
     RefreshTokenStore,
     TokenService,
 )
@@ -139,7 +140,11 @@ class VerifyOtp:
 
     async def _issue_tokens(self, uow, user: User) -> AuthTokens:
         family_id = new_uuid()
-        access = self._tokens.create_access_token(user.id, roles=[])
+        # Platform roles are stamped into the token here, once, from Identity's
+        # own grants (ADR-0011 §8). This was `roles=[]`, which is why nothing in
+        # the system could enforce anything: every token claimed no authority.
+        role_codes = await uow.platform_roles.role_codes_for_user(user.id)
+        access = self._tokens.create_access_token(user.id, roles=list(role_codes))
         raw_refresh, refresh_hash = self._tokens.create_refresh_token(user.id, family_id)
         await uow.refresh_tokens.save(
             user.id, refresh_hash, family_id, settings.refresh_token_ttl_seconds
@@ -148,11 +153,22 @@ class VerifyOtp:
 
 
 class RefreshAccessToken:
-    """Rotating refresh tokens with reuse detection."""
+    """Rotating refresh tokens with reuse detection.
 
-    def __init__(self, tokens: TokenService, refresh_store: RefreshTokenStore) -> None:
+    Refresh is also the point at which a role change takes effect: the new access
+    token is stamped with the grants as they are NOW. That, plus the access-token
+    TTL, is the whole of ADR-0011's bounded platform-role staleness.
+    """
+
+    def __init__(
+        self,
+        tokens: TokenService,
+        refresh_store: RefreshTokenStore,
+        platform_roles: PlatformRoleQuery,
+    ) -> None:
         self._tokens = tokens
         self._refresh = refresh_store
+        self._platform_roles = platform_roles
 
     async def execute(self, raw_refresh: str) -> AuthTokens:
         try:
@@ -181,7 +197,8 @@ class RefreshAccessToken:
         user_id = _uuid.UUID(payload["sub"])
         family_id = _uuid.UUID(payload["family_id"])
 
-        access = self._tokens.create_access_token(user_id, roles=[])
+        role_codes = await self._platform_roles.role_codes_for_user(user_id)
+        access = self._tokens.create_access_token(user_id, roles=list(role_codes))
         new_raw, new_hash = self._tokens.create_refresh_token(user_id, family_id)
         await self._refresh.rotate(token_hash, new_hash, settings.refresh_token_ttl_seconds)
         return AuthTokens(access_token=access, refresh_token=new_raw)

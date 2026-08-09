@@ -11,6 +11,7 @@ from src.modules.identity.infrastructure.repository import (
     SqlRefreshTokenStore,
     SqlUserRepository,
 )
+from src.modules.identity.infrastructure.role_repository import SqlPlatformRoleQuery
 from src.shared_kernel.infrastructure.unit_of_work import SqlAlchemyUnitOfWork
 
 
@@ -20,3 +21,5 @@ class SqlAlchemyIdentityUnitOfWork(SqlAlchemyUnitOfWork, IdentityUnitOfWork):
         # tracked. Refresh tokens are child entities (no events) — not tracked.
         self.users = SqlUserRepository(self.session, tracker=self)
         self.refresh_tokens = SqlRefreshTokenStore(self.session)
+        # Role grants are read-only reference data — no aggregate, nothing to track.
+        self.platform_roles = SqlPlatformRoleQuery(self.session)

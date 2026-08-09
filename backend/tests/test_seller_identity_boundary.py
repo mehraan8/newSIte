@@ -1,0 +1,235 @@
+"""The User/Seller identity boundary (ADR-0011 §7, Phase 1 pre-C).
+
+`User != Seller`. A User is a person; a Seller is a business owned by Merchant; a
+User reaches a Seller only through a SellerMember grant.
+
+Until Merchant (1C) and membership resolution (1F) exist there is no legitimate
+way to derive `Principal -> SellerMember -> Seller.id`, so offer creation is
+deliberately unavailable rather than minting `seller_id = user.id`.
+
+These tests are the regression lock. The source-level guard below is the one that
+matters most: it fails no matter WHERE someone reintroduces the collapse, not
+just in the router it was removed from.
+
+DB-free: the blocked route raises before touching a session, and authentication
+is JWT-only.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import datetime as dt
+import inspect
+import pathlib
+import re
+import tokenize
+import uuid
+
+import httpx
+import jwt as pyjwt
+import pytest
+
+from src.api.main import app
+from src.config.settings import settings
+from src.modules.selling.interface import router as selling_router
+from src.modules.selling.interface.schemas import CreateOfferRequest
+from src.shared_kernel.application.errors import AppError, CapabilityUnavailableError
+
+SRC = pathlib.Path(__file__).resolve().parents[1] / "src"
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+def access_token(user_id: uuid.UUID) -> str:
+    return pyjwt.encode(
+        {
+            "sub": str(user_id), "type": "access", "tenant_id": None, "roles": [],
+            "iat": dt.datetime.now(dt.timezone.utc),
+            "exp": dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1),
+        },
+        settings.jwt_secret, algorithm=settings.jwt_algorithm,
+    )
+
+
+def call(method: str, url: str, **kw) -> httpx.Response:
+    async def _go():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://testserver",
+        ) as client:
+            return await client.request(method, url, **kw)
+
+    return run(_go())
+
+
+OFFERS = "/api/v1/selling/offers"
+BODY = {"variant_id": str(uuid.uuid4()), "condition": "new",
+        "currency": "IRR", "amount": 1000, "scale": 0}
+
+
+# --- A. no caller-supplied seller identity ---------------------------------
+def test_request_schema_has_no_seller_id_field():
+    assert "seller_id" not in CreateOfferRequest.model_fields
+
+
+def test_body_supplied_seller_id_is_rejected_not_ignored():
+    """Silently ignoring it would hide an attempted impersonation."""
+    with pytest.raises(Exception) as exc:
+        CreateOfferRequest(seller_id=str(uuid.uuid4()), **BODY)
+    assert "seller_id" in str(exc.value)
+
+
+def test_body_supplied_seller_id_is_rejected_over_http():
+    resp = call("POST", OFFERS, json={**BODY, "seller_id": str(uuid.uuid4())},
+                headers={"Authorization": f"Bearer {access_token(uuid.uuid4())}"})
+    assert resp.status_code == 422, resp.text
+    assert "seller_id" in resp.text
+
+
+# --- B. the user-id-as-seller path no longer creates anything --------------
+def test_create_offer_no_longer_receives_the_authenticated_user():
+    """Structural: the collapse is impossible because the handler no longer has
+    a CurrentUser to take an id from."""
+    params = inspect.signature(selling_router.create_offer).parameters
+    assert "current" not in params
+    assert set(params) == {"body"}
+
+
+def test_create_offer_raises_capability_unavailable():
+    with pytest.raises(CapabilityUnavailableError):
+        run(selling_router.create_offer(CreateOfferRequest(**BODY)))
+
+
+def test_authenticated_offer_creation_returns_503_and_creates_nothing():
+    resp = call("POST", OFFERS, json=BODY,
+                headers={"Authorization": f"Bearer {access_token(uuid.uuid4())}"})
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["title"] == "capability_unavailable"
+
+
+def test_anonymous_offer_creation_still_fails_authentication_first():
+    """The block must not become an authentication bypass: no credential still
+    means 401, not 503."""
+    resp = call("POST", OFFERS, json=BODY)
+    assert resp.status_code == 401, resp.text
+
+
+def test_capability_unavailable_is_a_mapped_application_error():
+    assert issubclass(CapabilityUnavailableError, AppError)
+    assert CapabilityUnavailableError.http_status == 503
+    assert CapabilityUnavailableError.code == "capability_unavailable"
+
+
+# --- C. Seller exists in exactly one place: Merchant ------------------------
+# Until Phase 1C these two asserted Merchant did not exist yet. Phase 1C landed
+# it, so they now assert the DURABLE rule instead of the temporal one: Seller is
+# Merchant's and nobody else may define or own one.
+def test_seller_entities_are_defined_only_by_merchant():
+    """No context may grow its own Seller — that would be a second source of
+    truth for merchant identity (ADR-0011 §7)."""
+    definers = {
+        p.relative_to(SRC).parts[1] if p.relative_to(SRC).parts[0] == "modules" else "shared_kernel"
+        for p in SRC.rglob("*.py")
+        if re.search(r"^\s*class\s+(Seller|SellerMember)\b",
+                     p.read_text(encoding="utf-8"), re.M)
+    }
+    assert definers == {"merchant"}, f"Seller is defined outside Merchant: {definers}"
+
+
+def test_seller_tables_are_created_by_exactly_one_migration():
+    """One migration owns the Merchant schema, and no other migration may create
+    or FK to it."""
+    migrations = pathlib.Path(__file__).resolve().parents[1] / "migrations" / "versions"
+    creators = {
+        path.name for path in migrations.glob("*.py")
+        if 'create_table(\n        "sellers"' in path.read_text(encoding="utf-8")
+        or '"seller_members"' in path.read_text(encoding="utf-8")
+    }
+    assert creators == {"0019_merchant_seller_identity.py"}, creators
+
+
+# --- D/E. Phase 1A/1B artifacts unchanged in meaning ------------------------
+def test_jwt_still_carries_no_seller_information():
+    """Seller identity must never be solved by putting it in the token."""
+    from src.modules.identity.infrastructure.jwt_service import ACCESS_TOKEN_CLAIMS
+
+    assert ACCESS_TOKEN_CLAIMS == frozenset(
+        {"sub", "type", "tenant_id", "roles", "iat", "exp"}
+    )
+    for forbidden in ("seller_id", "seller_ids", "memberships",
+                      "seller_memberships", "seller_permissions"):
+        assert forbidden not in ACCESS_TOKEN_CLAIMS
+
+
+def test_principal_still_models_seller_membership_separately_from_subject():
+    """The Phase 1A shape already expresses User != Seller and must not have been
+    collapsed to make this phase easier."""
+    from src.shared_kernel.application.security import Principal, SellerGrant
+
+    subject = uuid.uuid4()
+    seller = uuid.uuid4()
+    principal = Principal(subject_id=subject)
+    # A user is NOT implicitly a member of a seller bearing their own id.
+    assert not principal.is_member_of(subject)
+    assert not principal.is_member_of(seller)
+    assert {f for f in SellerGrant.__dataclass_fields__} == {
+        "seller_id", "permissions", "status", "tenant_id"
+    }
+
+
+# --- the source-level regression lock --------------------------------------
+# Matches `seller_id = <principal-ish>.id` in any spacing/keyword form.
+COLLAPSE = re.compile(
+    r"seller_id\s*=\s*(?:str\(\s*)?"
+    r"(?:current|current_user|principal|user|claims)\s*\.\s*"
+    r"(?:id|subject_id|user_id)",
+)
+
+
+def _code_lines(path: pathlib.Path) -> dict[int, str]:
+    """Source with comments and string literals removed, keyed by line number.
+
+    Scanning raw text would flag the router docstring that *explains* the removed
+    pattern, and would equally miss nothing real — so the guard reads executable
+    tokens only. It therefore cannot be silenced by moving the collapse into a
+    string, and cannot be tripped by documenting it.
+    """
+    lines: dict[int, list[str]] = {}
+    with tokenize.open(path) as handle:
+        try:
+            for tok in tokenize.generate_tokens(handle.readline):
+                if tok.type in (tokenize.COMMENT, tokenize.STRING):
+                    continue
+                lines.setdefault(tok.start[0], []).append(tok.string)
+        except (tokenize.TokenError, IndentationError):  # pragma: no cover
+            return {}
+    return {no: "".join(parts) for no, parts in lines.items()}
+
+
+def test_no_source_file_derives_seller_identity_from_a_user():
+    """Fails wherever the collapse is reintroduced — not only in the router it
+    was removed from. This is the durable guard for `User != Seller`."""
+    offenders = []
+    for path in SRC.rglob("*.py"):
+        for lineno, code in _code_lines(path).items():
+            if COLLAPSE.search(code):
+                offenders.append(f"{path.relative_to(SRC)}:{lineno}: {code.strip()}")
+    assert offenders == [], (
+        "seller identity is being derived from a user identity:\n  "
+        + "\n  ".join(sorted(offenders))
+    )
+
+
+def test_the_guard_actually_detects_the_pattern_it_claims_to():
+    """A guard that cannot fail proves nothing."""
+    for sample in (
+        "        seller_id=str(current.id),",
+        "seller_id = current.id",
+        "seller_id=principal.subject_id",
+        "seller_id = current_user.id",
+    ):
+        assert COLLAPSE.search(sample), sample
+    assert not COLLAPSE.search("seller_id=str(offer.seller_id)")
+    assert not COLLAPSE.search("customer_id=str(current.id)")  # legitimate: a customer IS a user

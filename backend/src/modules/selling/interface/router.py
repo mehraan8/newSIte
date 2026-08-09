@@ -10,11 +10,9 @@ import uuid
 
 from fastapi import APIRouter, Depends, status
 
-from src.modules.identity.interface.dependencies import CurrentUser, get_current_user
-from src.modules.selling.application.dtos import (
-    ChangeOfferPriceCommand,
-    CreateOfferCommand,
-)
+from src.modules.identity.interface.dependencies import get_current_user
+from src.modules.selling.application.dtos import ChangeOfferPriceCommand
+from src.shared_kernel.application.errors import CapabilityUnavailableError
 from src.config.settings import settings
 from src.modules.selling.application.use_cases import (
     ActivateOffer,
@@ -60,23 +58,34 @@ def get_change_price() -> ChangeOfferPrice:
 
 
 @router.post("/offers", response_model=OfferResponse, status_code=status.HTTP_201_CREATED)
-async def create_offer(
-    body: CreateOfferRequest,
-    uc: CreateOffer = Depends(get_create_offer),
-    current: CurrentUser = Depends(get_current_user),
-) -> OfferResponse:
-    cmd = CreateOfferCommand(
-        # Authenticated principal — NOT a request field. A body-supplied
-        # seller_id is rejected by the schema (extra="forbid").
-        seller_id=str(current.id),
-        variant_id=str(body.variant_id),
-        condition=body.condition,
-        currency=body.currency,
-        amount=body.amount,
-        scale=body.scale,
-        compare_at_amount=body.compare_at_amount,
+async def create_offer(body: CreateOfferRequest) -> OfferResponse:
+    """INTENTIONALLY UNAVAILABLE until Phase 1G (ADR-0011 §7).
+
+    This endpoint previously established offer ownership with
+    `seller_id=str(current.id)` — the authenticated USER's id used as a MERCHANT
+    identity. That was the correct emergency fix for the body-supplied
+    `seller_id` impersonation hole, but it collapses `User == Seller`, which the
+    target model forbids: a Seller is a business owned by Merchant, and a User
+    reaches it only through a SellerMember grant.
+
+    There is no legitimate way to resolve `Principal -> SellerMember -> Seller.id`
+    until Merchant (Phase 1C) and membership resolution (Phase 1F) exist. Rather
+    than keep minting rows whose `seller_id` means the wrong thing — and which
+    would then propagate into the BuyBox projection and into immutable outbox
+    events — the endpoint fails explicitly.
+
+    Deliberately NOT done here: no fabricated seller, no temporary seller table,
+    no body-supplied `seller_id` (the schema still forbids it), no JWT seller
+    claim, no ambient state. Authentication is still enforced by the router-level
+    dependency, so an anonymous caller gets 401 and an authenticated one gets 503
+    — the failure is about a missing capability, not a missing credential.
+
+    Phase 1G restores this by taking the target seller from the caller's
+    memberships and verifying it with `Principal.can_for_seller`.
+    """
+    raise CapabilityUnavailableError(
+        "ثبت آفر تا زمان راه‌اندازی هویت فروشنده در دسترس نیست."
     )
-    return OfferResponse.from_view(await uc.execute(cmd))
 
 
 @router.post("/offers/{offer_id}/activate", response_model=OfferResponse)

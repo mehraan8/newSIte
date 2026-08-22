@@ -2,6 +2,11 @@
 
 Authentication is enforced here rather than delegated to a gateway: no gateway
 exists in this deployment, and these routes create offers and set prices.
+
+Authorization is NOT decided here. Every route hands the `Principal` to its use
+case, which resolves the offer's owning seller and checks the membership before
+mutating (ADR-0011 §9). Deciding it at the router would mean deciding it before
+the offer is loaded — and the offer is the only thing that knows who owns it.
 """
 
 from __future__ import annotations
@@ -10,9 +15,9 @@ import uuid
 
 from fastapi import APIRouter, Depends, status
 
-from src.modules.identity.interface.dependencies import get_current_user
-from src.modules.selling.application.dtos import ChangeOfferPriceCommand
-from src.shared_kernel.application.errors import CapabilityUnavailableError
+from src.api.dependencies import get_principal
+from src.modules.selling.application.dtos import ChangeOfferPriceCommand, CreateOfferCommand
+from src.shared_kernel.application.security import Principal
 from src.config.settings import settings
 from src.modules.selling.application.use_cases import (
     ActivateOffer,
@@ -31,8 +36,11 @@ from src.modules.selling.interface.schemas import (
 router = APIRouter(
     prefix="/selling",
     tags=["selling"],
-    # Authentication is mandatory for every route on this router.
-    dependencies=[Depends(get_current_user)],
+    # Authentication is mandatory for every route on this router — declared at the
+    # router so a future route cannot be added without it. FastAPI caches the
+    # dependency per request, so the routes below reuse this same Principal
+    # rather than resolving memberships a second time.
+    dependencies=[Depends(get_principal)],
 )
 
 
@@ -58,54 +66,57 @@ def get_change_price() -> ChangeOfferPrice:
 
 
 @router.post("/offers", response_model=OfferResponse, status_code=status.HTTP_201_CREATED)
-async def create_offer(body: CreateOfferRequest) -> OfferResponse:
-    """INTENTIONALLY UNAVAILABLE until Phase 1G (ADR-0011 §7).
+async def create_offer(
+    body: CreateOfferRequest,
+    principal: Principal = Depends(get_principal),
+    uc: CreateOffer = Depends(get_create_offer),
+) -> OfferResponse:
+    """Restored in Phase 1G with seller identity resolved from membership.
 
-    This endpoint previously established offer ownership with
-    `seller_id=str(current.id)` — the authenticated USER's id used as a MERCHANT
-    identity. That was the correct emergency fix for the body-supplied
-    `seller_id` impersonation hole, but it collapses `User == Seller`, which the
-    target model forbids: a Seller is a business owned by Merchant, and a User
-    reaches it only through a SellerMember grant.
-
-    There is no legitimate way to resolve `Principal -> SellerMember -> Seller.id`
-    until Merchant (Phase 1C) and membership resolution (Phase 1F) exist. Rather
-    than keep minting rows whose `seller_id` means the wrong thing — and which
-    would then propagate into the BuyBox projection and into immutable outbox
-    events — the endpoint fails explicitly.
-
-    Deliberately NOT done here: no fabricated seller, no temporary seller table,
-    no body-supplied `seller_id` (the schema still forbids it), no JWT seller
-    claim, no ambient state. Authentication is still enforced by the router-level
-    dependency, so an anonymous caller gets 401 and an authenticated one gets 503
-    — the failure is about a missing capability, not a missing credential.
-
-    Phase 1G restores this by taking the target seller from the caller's
-    memberships and verifying it with `Principal.can_for_seller`.
+    The 503 this replaces stood while `seller_id` had no honest source: the
+    earlier `seller_id=str(current.id)` made the authenticated USER the seller,
+    and the target model forbids that. Merchant (1C) and membership resolution
+    (1F) now supply the missing link, so ownership comes from a SellerMember
+    grant — the caller names the seller, the Principal proves they may act for
+    it, and a nomination that is not in their memberships is refused.
     """
-    raise CapabilityUnavailableError(
-        "ثبت آفر تا زمان راه‌اندازی هویت فروشنده در دسترس نیست."
+    cmd = CreateOfferCommand(
+        # str(...) matches the DTO's declared type; the value is the UUID parsed
+        # by the schema, so nothing unvalidated reaches the use case.
+        seller_id=str(body.seller_id),
+        variant_id=str(body.variant_id),
+        condition=body.condition,
+        currency=body.currency,
+        amount=body.amount,
+        scale=body.scale,
+        compare_at_amount=body.compare_at_amount,
     )
+    return OfferResponse.from_view(await uc.execute(cmd, principal))
 
 
 @router.post("/offers/{offer_id}/activate", response_model=OfferResponse)
 async def activate_offer(
-    offer_id: uuid.UUID, uc: ActivateOffer = Depends(get_activate_offer)
+    offer_id: uuid.UUID,
+    principal: Principal = Depends(get_principal),
+    uc: ActivateOffer = Depends(get_activate_offer),
 ) -> OfferResponse:
-    return OfferResponse.from_view(await uc.execute(offer_id))
+    return OfferResponse.from_view(await uc.execute(offer_id, principal))
 
 
 @router.post("/offers/{offer_id}/suspend", response_model=OfferResponse)
 async def suspend_offer(
-    offer_id: uuid.UUID, uc: SuspendOffer = Depends(get_suspend_offer)
+    offer_id: uuid.UUID,
+    principal: Principal = Depends(get_principal),
+    uc: SuspendOffer = Depends(get_suspend_offer),
 ) -> OfferResponse:
-    return OfferResponse.from_view(await uc.execute(offer_id))
+    return OfferResponse.from_view(await uc.execute(offer_id, principal))
 
 
 @router.patch("/offers/{offer_id}/price", response_model=OfferResponse)
 async def change_offer_price(
     offer_id: uuid.UUID,
     body: ChangeOfferPriceRequest,
+    principal: Principal = Depends(get_principal),
     uc: ChangeOfferPrice = Depends(get_change_price),
 ) -> OfferResponse:
     cmd = ChangeOfferPriceCommand(
@@ -114,4 +125,4 @@ async def change_offer_price(
         scale=body.scale,
         compare_at_amount=body.compare_at_amount,
     )
-    return OfferResponse.from_view(await uc.execute(offer_id, cmd))
+    return OfferResponse.from_view(await uc.execute(offer_id, cmd, principal))

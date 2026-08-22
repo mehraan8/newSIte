@@ -22,3 +22,12 @@ class SqlSellingGateway:
                 {"id": str(offer_id)},
             )
             return found is not None
+
+    async def seller_of(self, offer_id: uuid.UUID) -> uuid.UUID | None:
+        """Who owns this offer. Bound parameter, same as the existence check."""
+        async with self._sf() as session:
+            owner = await session.scalar(
+                text("SELECT seller_id FROM offers WHERE id = :id LIMIT 1"),
+                {"id": str(offer_id)},
+            )
+            return uuid.UUID(str(owner)) if owner is not None else None

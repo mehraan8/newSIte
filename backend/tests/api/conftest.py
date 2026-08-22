@@ -25,8 +25,14 @@ from tests.integration import db
 db.skip_if_unavailable()  # module-level: an unrun suite must never look green
 
 from src.api.main import app  # noqa: E402
-from src.modules.identity.domain.roles import Role  # noqa: E402
+from src.modules.identity.application.roles import PlatformRole  # noqa: E402
 from src.modules.identity.infrastructure.jwt_service import JwtTokenService  # noqa: E402
+from src.modules.merchant.domain.entities import SellerMemberRole  # noqa: E402
+from src.modules.merchant.infrastructure.membership_cache import (  # noqa: E402
+    MEMBERSHIP_KEY,
+    SELLER_KEY,
+)
+from src.shared_kernel.infrastructure.redis_client import get_redis  # noqa: E402
 
 pytestmark = pytest.mark.integration
 
@@ -45,6 +51,8 @@ API_TABLES = (
     "buy_box_variant_state",
     "buy_box_offer",
     "notifications",
+    "seller_members",
+    "sellers",
     "offer_prices",
     "offers",
     "prices",
@@ -97,6 +105,30 @@ def clean(schema):
     yield
 
 
+@pytest.fixture(autouse=True)
+def reset_rate_limits():
+    """Clear the shared rate-limit counters between tests.
+
+    Every test in this suite arrives from the same client address, so without
+    this the whole file shares one budget and tests fail depending on how many
+    ran before them — order-dependent, and the failure looks like a broken
+    endpoint rather than a full bucket.
+
+    This isolates tests; it does NOT disable the control. The limiter runs
+    normally inside each test, and tests/api/test_rate_limiting.py asserts that
+    it fires, that it fails closed, and that the budgets are per scope.
+    """
+
+    async def _clear():
+        redis = get_redis()
+        keys = [k async for k in redis.scan_iter(match="ratelimit:*", count=500)]
+        if keys:
+            await redis.delete(*keys)
+
+    db.run(_clear())
+    yield
+
+
 @pytest.fixture
 def client():
     """AsyncClient bound to the real app, reusable for many calls per test.
@@ -124,11 +156,14 @@ def call(client: httpx.AsyncClient, method: str, url: str, **kw) -> httpx.Respon
 
 # --- factories -------------------------------------------------------------
 def make_user(*, status: str = "active", roles: tuple[str, ...] = ()) -> uuid.UUID:
-    """Insert a user and its role grants directly.
+    """Insert a user and its PLATFORM role grants directly.
 
     Bypasses the OTP flow on purpose: the authorization matrix needs dozens of
     principals and should not depend on Redis or on OTP behaviour. The identity
     lifecycle tests use the real flow instead.
+
+    `roles` are platform roles only. Seller authority is NOT a role — it is a
+    membership, granted with `add_member` below.
     """
     user_id = uuid.uuid4()
     mobile = "+989" + str(uuid.uuid4().int)[:9]
@@ -142,7 +177,7 @@ def make_user(*, status: str = "active", roles: tuple[str, ...] = ()) -> uuid.UU
         # application uses, so a missing seed fails the test rather than hiding.
         role_id = db.scalar("select id from roles where code = :c", c=role)
         assert role_id is not None, (
-            f"role {role!r} is not seeded; migration 0019 should have created it"
+            f"role {role!r} is not seeded; migration 0020 should have created it"
         )
         db.execute(
             "insert into user_roles (user_id, role_id) values (:u, :r) "
@@ -159,6 +194,33 @@ def access_token(user_id: uuid.UUID, roles: tuple[str, ...] = ()) -> str:
 
 def auth(user_id: uuid.UUID, roles: tuple[str, ...] = ()) -> dict[str, str]:
     return {"Authorization": f"Bearer {access_token(user_id, roles)}"}
+
+
+def refresh_session(user_id: uuid.UUID) -> tuple[uuid.UUID, str]:
+    """A real refresh-token family for `user_id`. Returns (family_id, raw token).
+
+    Minted by the real `JwtTokenService` and persisted in `refresh_tokens` the
+    way `VerifyOtp._issue_tokens` does, so rotation, reuse detection and family
+    revocation all see exactly what they would in production. Bypasses the OTP
+    flow only to avoid depending on Redis and OTP timing.
+    """
+    family_id = uuid.uuid4()
+    raw, token_hash = JwtTokenService().create_refresh_token(user_id, family_id)
+    db.execute(
+        "insert into refresh_tokens (id, user_id, token_hash, family_id, expires_at) "
+        "values (:i, :u, :h, :f, now() + interval '30 days')",
+        i=uuid.uuid4(), u=user_id, h=token_hash, f=family_id,
+    )
+    return family_id, raw
+
+
+def live_tokens(family_id: uuid.UUID) -> int:
+    """Unrevoked rows in a family — what revocation is actually measured by."""
+    return db.scalar(
+        "select count(*) from refresh_tokens "
+        "where family_id = :f and revoked_at is null",
+        f=family_id,
+    )
 
 
 def principal(*roles: str, status: str = "active") -> tuple[uuid.UUID, dict[str, str]]:
@@ -209,23 +271,96 @@ def seed_variant() -> uuid.UUID:
     return vid
 
 
-def seed_offer(seller_id: uuid.UUID, variant_id: uuid.UUID, *, status: str = "active") -> uuid.UUID:
+def seed_offer(
+    seller_id: uuid.UUID, variant_id: uuid.UUID, *, status: str = "active",
+    amount: int | None = None,
+) -> uuid.UUID:
+    """An offer owned by a SELLER — never by a user (ADR-0011 §7.1)."""
     offer_id = uuid.uuid4()
     db.execute(
         "insert into offers (id, seller_id, variant_id, condition, currency, status) "
         "values (:id, :s, :v, 'new', 'IRR', :st)",
         id=offer_id, s=seller_id, v=variant_id, st=status,
     )
+    if amount is not None:
+        db.execute(
+            "insert into offer_prices (offer_id, amount, currency, scale) "
+            "values (:o, :a, 'IRR', 0)",
+            o=offer_id, a=amount,
+        )
     return offer_id
 
 
+# --- merchant: sellers and memberships -------------------------------------
+# A Seller is a business, and a User reaches it only through a SellerMember row.
+# These two factories are the ONLY way this suite confers seller authority —
+# there is no role to grant and no token claim to set.
+def make_seller(*, status: str = "active") -> uuid.UUID:
+    seller_id = uuid.uuid4()
+    db.execute(
+        "insert into sellers (id, code, name, status, version) "
+        "values (:i, :c, 'فروشگاه', :s, 1)",
+        i=seller_id, c=f"s-{uuid.uuid4().hex[:10]}", s=status,
+    )
+    return seller_id
+
+
+def add_member(
+    seller_id: uuid.UUID, user_id: uuid.UUID,
+    role: SellerMemberRole = SellerMemberRole.OWNER, *, status: str = "active",
+) -> None:
+    db.execute(
+        "insert into seller_members (seller_id, user_id, member_role_code, status) "
+        "values (:s, :u, :r, :st)",
+        s=seller_id, u=user_id, r=role.value, st=status,
+    )
+    forget(user_id, seller_id)
+
+
+def forget(user_id: uuid.UUID, *seller_ids: uuid.UUID) -> None:
+    """Drop the authorization cache entries for this user and these sellers.
+
+    Membership rows are inserted with raw SQL here, so the invalidation the
+    application would perform on a real membership change never happens. Without
+    this, a request made before the insert would leave a negative cache entry
+    that outlives the test. Tests that assert on REVOCATION call it explicitly,
+    which is also what the production write path must do.
+    """
+    async def _go():
+        redis = get_redis()
+        keys = [MEMBERSHIP_KEY.format(user_id=user_id)]
+        keys += [SELLER_KEY.format(seller_id=s) for s in seller_ids]
+        await redis.delete(*keys)
+
+    db.run(_go())
+
+
+def member(
+    role: SellerMemberRole = SellerMemberRole.OWNER, *,
+    seller_id: uuid.UUID | None = None, seller_status: str = "active",
+    member_status: str = "active",
+) -> tuple[uuid.UUID, uuid.UUID, dict[str, str]]:
+    """A user who is a member of a seller. Returns (seller_id, user_id, headers)."""
+    seller = seller_id if seller_id is not None else make_seller(status=seller_status)
+    user = make_user()
+    add_member(seller, user, role, status=member_status)
+    return seller, user, auth(user)
+
+
 __all__ = [
-    "Role",
+    "PlatformRole",
+    "SellerMemberRole",
     "access_token",
+    "add_member",
     "auth",
     "call",
+    "forget",
     "insert_returning",
+    "live_tokens",
+    "refresh_session",
+    "make_seller",
     "make_user",
+    "member",
     "principal",
     "seed_offer",
     "seed_variant",

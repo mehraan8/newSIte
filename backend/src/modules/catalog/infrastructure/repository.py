@@ -24,6 +24,24 @@ def _active_price_window():
     )
 
 
+def _escape_like(value: str) -> str:
+    """Neutralise LIKE metacharacters in user search input.
+
+    `q` is bound as a parameter, so this was never SQL injection — but `%` and
+    `_` are wildcards to the DATABASE, not to the parameter binder. A search for
+    `%` matched every row and scanned the whole table, and a pattern of
+    alternating wildcards is pathological for the matcher, on a PUBLIC
+    unauthenticated endpoint. That is an availability problem, not an injection
+    one, and it needs a different fix.
+
+    Escaping also makes the endpoint behave the way a search box should: a
+    shopper typing "50%" is looking for the characters "50%", not asking for a
+    wildcard. The backslash must be escaped first, or it would escape the
+    escapes added after it.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 class CatalogReadRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._s = session
@@ -45,7 +63,9 @@ class CatalogReadRepository:
         if brand_slug:
             stmt = stmt.where(BrandModel.slug == brand_slug)
         if q:
-            stmt = stmt.where(ProductModel.name_fa.ilike(f"%{q}%"))
+            stmt = stmt.where(
+                ProductModel.name_fa.ilike(f"%{_escape_like(q)}%", escape="\\")
+            )
         return stmt
 
     async def list_products(

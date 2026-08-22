@@ -15,6 +15,7 @@ from src.modules.selling.application.dtos import (
     CreateOfferCommand,
     OfferView,
 )
+from src.modules.selling.application.policies import ensure_can_act_for_seller
 from src.modules.selling.application.ports import CatalogGateway
 from src.modules.selling.application.unit_of_work import SellingUnitOfWork
 from src.modules.selling.domain.entities import Offer
@@ -24,6 +25,8 @@ from src.shared_kernel.application.errors import (
     NotFoundError,
     ValidationError,
 )
+from src.shared_kernel.application.permissions import Permission
+from src.shared_kernel.application.security import Principal
 from src.shared_kernel.domain.value_objects import Money
 
 UowFactory = Callable[[], SellingUnitOfWork]
@@ -38,7 +41,16 @@ class CreateOffer:
         self._uow_factory = uow_factory
         self._catalog = catalog
 
-    async def execute(self, cmd: CreateOfferCommand) -> OfferView:
+    async def execute(self, cmd: CreateOfferCommand, principal: Principal) -> OfferView:
+        # AUTHORIZE FIRST. There is no existing offer to take ownership from, so
+        # the caller nominates a target seller and the nomination is honoured
+        # only if it is one of THEIR memberships. This is what makes a
+        # client-supplied seller_id a resource selector rather than a claim of
+        # authority: naming another seller — or one's own user id — resolves to
+        # no membership and is denied (ADR-0011 §7.1).
+        seller_id = uuid.UUID(cmd.seller_id)
+        ensure_can_act_for_seller(principal, seller_id, Permission.SELLING_OFFERS_CREATE)
+
         variant_id = uuid.UUID(cmd.variant_id)
         # ACL read OUTSIDE the transaction — validate the variant exists.
         if not await self._catalog.variant_exists(variant_id):
@@ -55,7 +67,7 @@ class CreateOffer:
         async with uow:
             try:
                 offer = Offer.create(
-                    seller_id=uuid.UUID(cmd.seller_id),
+                    seller_id=seller_id,
                     variant_id=variant_id,
                     condition=cmd.condition,
                     currency=cmd.currency,
@@ -75,12 +87,17 @@ class ActivateOffer:
         # Configurable invariant injected from settings at the composition root.
         self._one_active_per_variant = one_active_per_variant
 
-    async def execute(self, offer_id: uuid.UUID) -> OfferView:
+    async def execute(self, offer_id: uuid.UUID, principal: Principal) -> OfferView:
         uow = self._uow_factory()
         async with uow:
             offer = await uow.offers.get_by_id(offer_id)
             if offer is None:
                 raise NotFoundError("آفر یافت نشد.")
+            # The OFFER's seller owns it — never the caller. Checked after the
+            # load and before any mutation, so a denial leaves the offer intact.
+            ensure_can_act_for_seller(
+                principal, offer.seller_id, Permission.SELLING_OFFERS_ACTIVATE
+            )
 
             # Configurable invariant: one active offer per seller per variant.
             if self._one_active_per_variant:
@@ -105,12 +122,15 @@ class SuspendOffer:
     def __init__(self, uow_factory: UowFactory) -> None:
         self._uow_factory = uow_factory
 
-    async def execute(self, offer_id: uuid.UUID) -> OfferView:
+    async def execute(self, offer_id: uuid.UUID, principal: Principal) -> OfferView:
         uow = self._uow_factory()
         async with uow:
             offer = await uow.offers.get_by_id(offer_id)
             if offer is None:
                 raise NotFoundError("آفر یافت نشد.")
+            ensure_can_act_for_seller(
+                principal, offer.seller_id, Permission.SELLING_OFFERS_SUSPEND
+            )
             try:
                 offer.suspend()
             except SellingDomainError as exc:
@@ -124,12 +144,17 @@ class ChangeOfferPrice:
     def __init__(self, uow_factory: UowFactory) -> None:
         self._uow_factory = uow_factory
 
-    async def execute(self, offer_id: uuid.UUID, cmd: ChangeOfferPriceCommand) -> OfferView:
+    async def execute(
+        self, offer_id: uuid.UUID, cmd: ChangeOfferPriceCommand, principal: Principal
+    ) -> OfferView:
         uow = self._uow_factory()
         async with uow:
             offer = await uow.offers.get_by_id(offer_id)
             if offer is None:
                 raise NotFoundError("آفر یافت نشد.")
+            ensure_can_act_for_seller(
+                principal, offer.seller_id, Permission.SELLING_OFFERS_PRICE_CHANGE
+            )
             compare = (
                 _money(cmd.compare_at_amount, cmd.currency, cmd.scale)
                 if cmd.compare_at_amount is not None

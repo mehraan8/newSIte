@@ -10,15 +10,26 @@ from src.modules.selling.application.dtos import OfferView
 
 
 class CreateOfferRequest(BaseModel):
-    """No seller_id: it comes from the bearer token, exactly as Ordering derives
-    customer_id. extra="forbid" so a client still sending `seller_id` gets a 422
-    instead of having it silently ignored — silent ignoring hides an attempted
-    impersonation, rejecting surfaces it."""
+    """`seller_id` is a TARGET SELECTOR, not a claim of authority (ADR-0011 §7.1).
+
+    It was previously banned outright, back when the token was the only source of
+    seller identity. It no longer is: a User is not a Seller, and one User can be
+    a member of several Sellers — staff at one, manager at another — so there is
+    nothing to infer from and the caller has to say which seller the offer is
+    for. What makes this safe is not who sends the field but who proves it: the
+    use case honours the nomination only if that seller appears in
+    `Principal.memberships` with `selling.offers.create`. Naming someone else's
+    seller, or one's own user id, resolves to no membership and is denied.
+
+    extra="forbid" is kept for every OTHER unexpected field, so a client sending
+    a field the server does not model gets a 422 rather than silent acceptance.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     # UUID-typed: a malformed id is a 422 from the schema rather than a ValueError
     # from uuid.UUID() inside the use case (previously a 500). Wire format unchanged.
+    seller_id: uuid.UUID
     variant_id: uuid.UUID
     condition: str = "new"
     # Money constraints mirror the Money value object, which rejects a negative

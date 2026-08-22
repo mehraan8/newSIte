@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+import uuid as _uuid
 from typing import Callable
 
 from src.config.settings import settings
@@ -25,8 +26,9 @@ from src.modules.identity.application.ports import (
     PlatformRoleQuery,
     RefreshTokenStore,
     TokenService,
+    UserStatusQuery,
 )
-from src.modules.identity.domain.entities import User
+from src.modules.identity.domain.entities import User, may_authenticate
 from src.modules.identity.domain.exceptions import UserBlockedError
 from src.shared_kernel.application.errors import (
     ForbiddenError,
@@ -165,10 +167,12 @@ class RefreshAccessToken:
         tokens: TokenService,
         refresh_store: RefreshTokenStore,
         platform_roles: PlatformRoleQuery,
+        user_status: UserStatusQuery,
     ) -> None:
         self._tokens = tokens
         self._refresh = refresh_store
         self._platform_roles = platform_roles
+        self._user_status = user_status
 
     async def execute(self, raw_refresh: str) -> AuthTokens:
         try:
@@ -185,20 +189,83 @@ class RefreshAccessToken:
         # Reuse detection: a presented-but-unknown refresh token means the
         # family may be compromised → revoke the whole family.
         if meta is None:
-            import uuid as _uuid
-
             family = payload.get("family_id")
             if family:
                 await self._refresh.revoke_family(_uuid.UUID(family))
             raise UnauthorizedError("توکن نامعتبر یا استفاده‌شده است.")
 
-        import uuid as _uuid
-
         user_id = _uuid.UUID(payload["sub"])
         family_id = _uuid.UUID(payload["family_id"])
 
+        # The account gate, checked AFTER reuse detection so a blocked user
+        # replaying a stolen token still burns the family (D1 semantics are
+        # unchanged), and BEFORE minting so a blocked account cannot renew.
+        # Without this, blocking a user only lasted until their current access
+        # token expired: refresh would hand them a fresh one indefinitely, which
+        # made account lockout cosmetic.
+        if not may_authenticate(await self._user_status.status_of(user_id)):
+            raise UnauthorizedError("حساب کاربری شما غیرفعال است.")
+
+        # Mint the candidate refresh token first — it is pure computation, and
+        # worthless until the row below persists it — then CLAIM the old one.
+        # Rotation is the point of no return, so nothing is handed back before
+        # the claim succeeds.
+        new_raw, new_hash = self._tokens.create_refresh_token(user_id, family_id)
+        if not await self._refresh.rotate(
+            token_hash, new_hash, settings.refresh_token_ttl_seconds
+        ):
+            # Someone else consumed this token between the read above and here.
+            # That is indistinguishable from replaying a spent token, so it is
+            # treated identically: burn the family. Two clients racing a refresh
+            # get logged out, which is the safe direction — the alternative is
+            # the race that let a thief and the victim each hold a live token
+            # while reuse detection never fired.
+            await self._refresh.revoke_family(family_id)
+            raise UnauthorizedError("توکن نامعتبر یا استفاده‌شده است.")
+
         role_codes = await self._platform_roles.role_codes_for_user(user_id)
         access = self._tokens.create_access_token(user_id, roles=list(role_codes))
-        new_raw, new_hash = self._tokens.create_refresh_token(user_id, family_id)
-        await self._refresh.rotate(token_hash, new_hash, settings.refresh_token_ttl_seconds)
         return AuthTokens(access_token=access, refresh_token=new_raw)
+
+
+class Logout:
+    """Ends a session by revoking the presented refresh token's whole family.
+
+    Takes the REFRESH token, not the access token, for two reasons. Access tokens
+    are stateless and cannot be un-issued, so the family is the only thing there
+    is to revoke; and possession of a valid refresh token IS the credential, so
+    someone holding a leaked one being able to burn it is a feature. Requiring a
+    working access token would mean a user whose session is already half-lost
+    could not end it.
+
+    Scope is derived from the CRYPTOGRAPHICALLY VALIDATED token, never from a
+    request field: `decode` verifies the signature, so `family_id` is a claim the
+    server itself minted for that user. A caller cannot name someone else's
+    family, and there is no code path that revokes more than one.
+
+    Idempotent. `revoke_family` touches only rows with `revoked_at IS NULL`, so a
+    second logout updates nothing and still succeeds — a client retrying after a
+    dropped response must not get an error for a session that is already gone.
+
+    What this does NOT do: it does not invalidate already-issued ACCESS tokens.
+    Nothing in this architecture can — they are stateless and unrevocable until
+    they expire. Immediate account-level enforcement is a different control, and
+    it lives in the authentication gate (`get_access_claims`).
+    """
+
+    def __init__(self, tokens: TokenService, refresh_store: RefreshTokenStore) -> None:
+        self._tokens = tokens
+        self._refresh = refresh_store
+
+    async def execute(self, raw_refresh: str) -> None:
+        try:
+            payload = self._tokens.decode(raw_refresh)
+        except Exception as exc:  # noqa: BLE001
+            raise UnauthorizedError("توکن نامعتبر است.") from exc
+        if payload.get("type") != "refresh":
+            raise UnauthorizedError("نوع توکن نامعتبر است.")
+
+        family = payload.get("family_id")
+        if not family:
+            raise UnauthorizedError("توکن نامعتبر است.")
+        await self._refresh.revoke_family(_uuid.UUID(family))

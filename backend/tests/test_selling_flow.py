@@ -36,7 +36,10 @@ from src.modules.selling.domain.entities import (
     OfferPriceChanged,
     OfferStatus,
 )
+from src.modules.merchant.application.member_permissions import MEMBER_ROLE_PERMISSIONS
+from src.modules.merchant.domain.entities import SellerMemberRole
 from src.shared_kernel.application.errors import ConflictError, NotFoundError, ValidationError
+from src.shared_kernel.application.security import Principal, SellerGrant, SellerStatus
 from src.shared_kernel.infrastructure.outbox.serialization import event_payload
 
 
@@ -95,6 +98,22 @@ class FakeSellingUoW(SellingUnitOfWork):
 VARIANT = str(uuid.uuid4())
 SELLER = str(uuid.uuid4())
 
+# This suite validates the offer LIFECYCLE, so its principal is always fully
+# authorized for SELLER — an owner member of it. Authorization itself is proven
+# in tests/test_selling_offer_authorization.py; here it must simply not get in
+# the way, and passing a real Principal keeps the two suites exercising the same
+# code path rather than a bypass.
+OWNER = Principal(
+    subject_id=uuid.uuid4(),
+    memberships={
+        uuid.UUID(SELLER): SellerGrant(
+            seller_id=uuid.UUID(SELLER),
+            permissions=MEMBER_ROLE_PERMISSIONS[SellerMemberRole.OWNER],
+            status=SellerStatus.ACTIVE,
+        )
+    },
+)
+
 
 async def main():
     store: dict = {}
@@ -108,13 +127,13 @@ async def main():
 
     # === ACL: unknown variant rejected, no offer created ===
     assert await expect(NotFoundError, lambda: create.execute(
-        CreateOfferCommand(seller_id=SELLER, variant_id=str(uuid.uuid4()), amount=1000)))
+        CreateOfferCommand(seller_id=SELLER, variant_id=str(uuid.uuid4()), amount=1000), OWNER))
     print("[acl]      unknown variant -> NotFound (catalog ACL)")
 
     # === create with initial price -> OfferCreated + OfferPriceChanged ===
     view = await create.execute(CreateOfferCommand(
         seller_id=SELLER, variant_id=VARIANT, condition="new", currency="IRR",
-        amount=18_900_000, scale=0))
+        amount=18_900_000, scale=0), OWNER)
     assert view.status == "draft" and view.price is not None and view.price.amount == 18_900_000
     kinds = [type(e).__name__ for e in uow.outbox]
     assert kinds == ["OfferCreated", "OfferPriceChanged"], kinds
@@ -124,7 +143,7 @@ async def main():
 
     # === price mutation only via aggregate + event-driven ===
     n = len(uow.outbox)
-    view2 = await change.execute(offer_id, ChangeOfferPriceCommand(amount=17_500_000, currency="IRR"))
+    view2 = await change.execute(offer_id, ChangeOfferPriceCommand(amount=17_500_000, currency="IRR"), OWNER)
     assert view2.price is not None and view2.price.amount == 17_500_000
     pc = [e for e in uow.outbox if isinstance(e, OfferPriceChanged)]
     assert pc[-1].old_amount == 18_900_000 and pc[-1].new_amount == 17_500_000
@@ -133,11 +152,11 @@ async def main():
 
     # === currency mismatch -> ValidationError (domain guard) ===
     assert await expect(ValidationError, lambda: change.execute(
-        offer_id, ChangeOfferPriceCommand(amount=10, currency="USD", scale=2)))
+        offer_id, ChangeOfferPriceCommand(amount=10, currency="USD", scale=2), OWNER))
     print("[currency] cross-currency price change rejected")
 
     # === activate -> OfferActivated with BuyBox-ready data ===
-    view3 = await activate.execute(offer_id)
+    view3 = await activate.execute(offer_id, OWNER)
     assert view3.status == "active"
     act = [e for e in uow.outbox if isinstance(e, OfferActivated)][-1]
     bb = event_payload(act)
@@ -150,8 +169,8 @@ async def main():
 
     # === configurable invariant: 2nd active offer for same seller+variant ===
     v2 = await create.execute(CreateOfferCommand(
-        seller_id=SELLER, variant_id=VARIANT, condition="refurbished", currency="IRR", amount=12_000_000))
-    assert await expect(ConflictError, lambda: activate.execute(uuid.UUID(v2.id)))
+        seller_id=SELLER, variant_id=VARIANT, condition="refurbished", currency="IRR", amount=12_000_000), OWNER)
+    assert await expect(ConflictError, lambda: activate.execute(uuid.UUID(v2.id), OWNER))
     print("[invariant] 2nd active offer blocked when flag ON")
 
     # ...same scenario with the invariant DISABLED -> allowed
@@ -160,19 +179,19 @@ async def main():
     f2 = lambda: uow2
     create2 = CreateOffer(uow_factory=f2, catalog=catalog)
     activate_off = ActivateOffer(uow_factory=f2, one_active_per_variant=False)
-    a = await create2.execute(CreateOfferCommand(seller_id=SELLER, variant_id=VARIANT, currency="IRR", amount=1))
-    b = await create2.execute(CreateOfferCommand(seller_id=SELLER, variant_id=VARIANT, condition="used", currency="IRR", amount=2))
-    await activate_off.execute(uuid.UUID(a.id))
-    await activate_off.execute(uuid.UUID(b.id))     # no ConflictError
+    a = await create2.execute(CreateOfferCommand(seller_id=SELLER, variant_id=VARIANT, currency="IRR", amount=1), OWNER)
+    b = await create2.execute(CreateOfferCommand(seller_id=SELLER, variant_id=VARIANT, condition="used", currency="IRR", amount=2), OWNER)
+    await activate_off.execute(uuid.UUID(a.id), OWNER)
+    await activate_off.execute(uuid.UUID(b.id), OWNER)     # no ConflictError
     print("[invariant] multi-offer allowed when flag OFF (marketplace mode)")
 
     # === activate without price -> ValidationError ===
     uow3 = FakeSellingUoW({})
     cr3 = CreateOffer(uow_factory=lambda: uow3, catalog=catalog)
     ac3 = ActivateOffer(uow_factory=lambda: uow3, one_active_per_variant=True)
-    nop = await cr3.execute(CreateOfferCommand(seller_id=SELLER, variant_id=VARIANT, currency="IRR"))
+    nop = await cr3.execute(CreateOfferCommand(seller_id=SELLER, variant_id=VARIANT, currency="IRR"), OWNER)
     assert nop.price is None
-    assert await expect(ValidationError, lambda: ac3.execute(uuid.UUID(nop.id)))
+    assert await expect(ValidationError, lambda: ac3.execute(uuid.UUID(nop.id), OWNER))
     print("[priced]   activate without price rejected")
 
     print("\nSELLING CONTEXT VALIDATED (offer lifecycle + pricing + invariants + events)")

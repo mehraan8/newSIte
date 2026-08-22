@@ -6,17 +6,34 @@ from __future__ import annotations
 
 import logging
 
+from src.config.settings import settings
 from src.shared_kernel.domain.value_objects import Mobile
 
 logger = logging.getLogger("identity.sms")
 
 
 class ConsoleOtpSender:
-    """Logs the code instead of sending an SMS — dev/test only."""
+    """Stands in for an SMS provider in development.
+
+    It used to log the plaintext code AND the unmasked number on every request.
+    An OTP is a credential and a mobile number is PII, so that put both into the
+    application log — and in a container, straight into whatever aggregates
+    stdout. Because `sms_provider` defaults to "console", a deployment that
+    simply forgot to configure a provider logged every OTP it issued.
+
+    Now the code is emitted only when `OTP_LOG_CODES` is explicitly set, which
+    `Settings` refuses outside development. The default path records that a code
+    was sent, to a MASKED number, and nothing else — enough to debug delivery,
+    useless to an attacker reading logs.
+    """
 
     async def send_code(self, mobile: Mobile, code: str) -> None:
-        logger.info("OTP for %s -> %s", mobile.masked, code)
-        print(f"[OTP] {mobile} : {code}")  # noqa: T201 - intentional dev output
+        if settings.otp_log_codes:
+            # Development convenience, gated and never reachable in production.
+            logger.warning("OTP for %s -> %s  (OTP_LOG_CODES is on)", mobile.masked, code)
+            print(f"[OTP] {mobile.masked} : {code}")  # noqa: T201
+            return
+        logger.info("OTP dispatched to %s", mobile.masked)
 
 
 class KavenegarOtpSender:

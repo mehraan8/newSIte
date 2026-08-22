@@ -20,6 +20,7 @@ from src.modules.inventory.application.dtos import (
     ReserveStockCommand,
     StockView,
 )
+from src.modules.inventory.application.policies import ensure_can_receive_stock
 from src.modules.inventory.application.ports import SellingGateway
 from src.modules.inventory.application.unit_of_work import InventoryUnitOfWork
 from src.modules.inventory.domain.entities import (
@@ -34,6 +35,7 @@ from src.shared_kernel.application.errors import (
     NotFoundError,
     ValidationError,
 )
+from src.shared_kernel.application.security import Principal
 from src.shared_kernel.domain.base import utcnow
 
 logger = logging.getLogger(__name__)
@@ -67,10 +69,15 @@ class ReceiveStock:
         self._uow_factory = uow_factory
         self._selling = selling
 
-    async def execute(self, cmd: ReceiveStockCommand) -> StockView:
+    async def execute(self, cmd: ReceiveStockCommand, principal: Principal) -> StockView:
         offer_id = uuid.UUID(cmd.offer_id)
-        if not await self._selling.offer_exists(offer_id):
+        # The OFFER's seller owns the stock — never the caller. Resolved through
+        # the ACL, then decided from the Principal snapshot, before any mutation
+        # so a denial leaves the counters untouched.
+        seller_id = await self._selling.seller_of(offer_id)
+        if seller_id is None:
             raise NotFoundError("آفر موردنظر یافت نشد.")
+        ensure_can_receive_stock(principal, seller_id)
 
         async def op() -> StockView:
             uow = self._uow_factory()

@@ -91,11 +91,34 @@ class PlatformRoleQuery(Protocol):
     async def role_codes_for_user(self, user_id: uuid.UUID) -> tuple[str, ...]: ...
 
 
+class UserStatusQuery(Protocol):
+    """"What is this user's account status right now?" — and nothing else.
+
+    Deliberately NOT `UserRepository.get_by_id`. The authentication gate runs on
+    every authenticated request and needs one indexed column, not a hydrated
+    aggregate; loading the aggregate would also register it with the UoW tracker,
+    which is wrong for a read that must have no write-side effects.
+
+    Returns the raw status string, or None when the user row does not exist. The
+    caller decides what that means via `domain.entities.may_authenticate`, so the
+    policy lives in one place and the adapter stays a dumb read.
+    """
+
+    async def status_of(self, user_id: uuid.UUID) -> str | None: ...
+
+
 class RefreshTokenStore(Protocol):
     async def save(
         self, user_id: uuid.UUID, token_hash: str, family_id: uuid.UUID, ttl: int
     ) -> None: ...
     async def is_valid(self, token_hash: str) -> bool: ...
-    async def rotate(self, old_hash: str, new_hash: str, ttl: int) -> None: ...
+    async def rotate(self, old_hash: str, new_hash: str, ttl: int) -> bool:
+        """Consume `old_hash` and issue `new_hash` ATOMICALLY.
+
+        Returns False when the token was already consumed — by a concurrent
+        request or an earlier one. The caller must treat that as reuse: it is
+        indistinguishable from it, and the safe reading is the hostile one.
+        """
+        ...
     async def revoke_family(self, family_id: uuid.UUID) -> None: ...
     async def get_meta(self, token_hash: str) -> dict | None: ...

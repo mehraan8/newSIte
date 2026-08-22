@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.modules.catalog.application.write_dtos import ProductView
 
@@ -17,13 +17,23 @@ from src.modules.catalog.application.write_dtos import ProductView
 _SLUG_PATTERN = r"^[a-z0-9]+(?:-[a-z0-9]+)*$"
 
 
+# extra="forbid" throughout, matching CheckoutBody and CreateOfferRequest. A
+# client sending `id`, `status` or `owner_id` on create was previously accepted
+# and the field silently dropped — safe, but it hides an attempted privilege
+# injection instead of surfacing it. Rejecting makes the attempt visible in logs
+# and to the caller, and stops a future field rename from turning a
+# silently-ignored input into a silently-honoured one.
 class VariantRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     sku: str = Field(min_length=1, max_length=64)
     variant_axis_values: dict = Field(default_factory=dict)
     barcode: str | None = Field(default=None, max_length=64)
 
 
 class CreateProductRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     product_type_id: int = Field(ge=1)
     category_id: int = Field(ge=1)
     # Pattern mirrors the Slug value object, which raises InvalidSlugError.
@@ -36,6 +46,8 @@ class CreateProductRequest(BaseModel):
 
 
 class UpdateProductRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name_fa: str | None = Field(default=None, min_length=1, max_length=255)
     description: str | None = None
     brand_id: int | None = Field(default=None, ge=1)

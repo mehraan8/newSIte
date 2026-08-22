@@ -36,6 +36,8 @@ from src.modules.inventory.application.use_cases import (  # noqa: E402
 )
 from src.modules.inventory.domain.entities import ReservationStatus  # noqa: E402
 from src.modules.inventory.infrastructure.selling_acl import SqlSellingGateway  # noqa: E402
+from src.shared_kernel.application.permissions import Permission  # noqa: E402
+from src.shared_kernel.application.security import Principal  # noqa: E402
 from src.modules.inventory.infrastructure.unit_of_work import (  # noqa: E402
     SqlAlchemyInventoryUnitOfWork,
 )
@@ -121,11 +123,23 @@ def drain_relay(max_passes: int = 12) -> int:
     return passes
 
 
+# These suites validate the inventory LIFECYCLE, not authorization, so their
+# principal is a platform operator holding `inventory.manage.any`. Authorization
+# itself is proved in tests/test_inventory_authorization.py and
+# tests/api/test_admin_authorization.py; here it must simply not get in the way,
+# and passing a real Principal keeps this exercising the same code path rather
+# than a bypass.
+OPERATOR = Principal(
+    subject_id=uuid.uuid4(),
+    platform_permissions=frozenset({Permission.INVENTORY_MANAGE_ANY}),
+)
+
+
 def seed_stock(offer_id: uuid.UUID, qty: int) -> None:
     with system_event_context(region="ir"):
         run(
             ReceiveStock(inv_uow, SqlSellingGateway(session_factory=db.session_factory()))
-            .execute(ReceiveStockCommand(offer_id=str(offer_id), location=LOC, quantity=qty))
+            .execute(ReceiveStockCommand(offer_id=str(offer_id), location=LOC, quantity=qty), OPERATOR)
         )
 
 
@@ -538,6 +552,14 @@ def test_selling_acl_is_the_only_coupling_and_is_read_only(offer_id):
 
     assert run(gateway.offer_exists(offer_id)) is True
     assert run(gateway.offer_exists(uuid.uuid4())) is False
+
+    # `seller_of` is what authorization reads: it must name the real owner, and
+    # answer None — not raise, and not guess — for an offer that does not exist.
+    # A None that was mistaken for "no owner, therefore allowed" would reopen the
+    # hole the audit found, so the use case treats it as 404.
+    owner = db.scalar("select seller_id from offers where id = :i", i=offer_id)
+    assert run(gateway.seller_of(offer_id)) == owner
+    assert run(gateway.seller_of(uuid.uuid4())) is None
 
     seed_stock(offer_id, 3)
     assert db.scalar("select count(*) from offers") == before

@@ -9,21 +9,21 @@ import uuid
 from fastapi import Depends, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.security import PrincipalFactory
 from src.modules.identity.application.ports import AccessTokenClaims
 from src.modules.identity.application.use_cases import (
+    Logout,
     RefreshAccessToken,
     RequestOtp,
     VerifyOtp,
 )
 from src.modules.identity.infrastructure.jwt_service import JwtTokenService
 from src.modules.identity.infrastructure.otp_store import RedisOtpStore
-from src.modules.identity.infrastructure.repository import SqlRefreshTokenStore
-from src.modules.identity.infrastructure.role_repository import (
-    SqlPlatformRoleQuery,
-    SqlRoleGrantsQuery,
+from src.modules.identity.domain.entities import may_authenticate
+from src.modules.identity.infrastructure.repository import (
+    SqlRefreshTokenStore,
+    SqlUserStatusQuery,
 )
-from src.shared_kernel.application.security import Principal
+from src.modules.identity.infrastructure.role_repository import SqlPlatformRoleQuery
 from src.modules.identity.infrastructure.unit_of_work import SqlAlchemyIdentityUnitOfWork
 from src.modules.identity.infrastructure.sms_sender import (
     ConsoleOtpSender,
@@ -63,44 +63,70 @@ def get_refresh_token(session: AsyncSession = Depends(get_session)) -> RefreshAc
         # Rotation re-stamps the token with the grants as they are now, which is
         # how a role change takes effect within one access-token lifetime.
         platform_roles=SqlPlatformRoleQuery(session),
+        # Refresh is the one place a blocked account could otherwise renew itself
+        # indefinitely, so the account gate applies here too, not only on
+        # authenticated requests.
+        user_status=SqlUserStatusQuery(session),
     )
 
 
-def get_principal_factory(
+def get_logout(session: AsyncSession = Depends(get_session)) -> Logout:
+    return Logout(
+        tokens=JwtTokenService(),
+        refresh_store=SqlRefreshTokenStore(session),
+    )
+
+
+async def get_access_claims(
+    authorization: str = Header(default=""),
     session: AsyncSession = Depends(get_session),
-) -> PrincipalFactory:
-    """Composition root for Principal assembly (ADR-0011 §3).
-
-    Wired here because this module is already the Identity composition root and
-    owns the RBAC grant adapters. Phase 1F injects the cache-backed
-    MembershipQuery; until then memberships resolve to empty, which is
-    fail-closed for every seller-scoped question.
-    """
-    return PrincipalFactory(role_grants=SqlRoleGrantsQuery(session))
-
-
-async def get_access_claims(authorization: str = Header(default="")) -> AccessTokenClaims:
-    """Validates the bearer access token and returns its claims.
+) -> AccessTokenClaims:
+    """THE authentication gate. Validates the credential AND the account.
 
     The single validation path: `get_current_user` and Principal assembly both
-    read from here, so authentication cannot drift between them.
+    read from here, so authentication cannot drift between them — and so the
+    account-status check below cannot be forgotten by a route or a context.
+
+    Two separate questions, in order:
+
+      1. is the CREDENTIAL good?  — signature, algorithm, type, expiry, claim
+         shape. Pure JWT work, done by `decode_access`.
+      2. may the ACCOUNT act?     — the authoritative answer lives in
+         `users.status`, never in the token.
+
+    Why (2) cannot be answered from the token: a JWT is a snapshot of what was
+    true when it was signed. Blocking a user is a decision made *after* that, and
+    an unexpired signature must not outvote it. ADR-0011 §8 accepts stale ROLES
+    for the life of an access token, bounded and deliberate; it does not accept a
+    stale ACCOUNT. Shortening the TTL would only narrow the window, not close it.
+
+    The cost is one primary-key read per authenticated request, which is the
+    smallest mechanism that makes the guarantee real. It happens HERE, before
+    Principal assembly, so a blocked caller never reaches membership resolution,
+    the Redis cache, or any authorization decision.
+
+    401, not 403: a blocked account is a failure to authenticate, not a missing
+    permission. The message differs from the generic one because reaching it
+    requires already holding a server-issued token for that exact subject — it
+    discloses nothing the caller does not already have, and a locked-out user
+    deserves to know why.
     """
     if not authorization.lower().startswith("bearer "):
         raise UnauthorizedError("توکن دسترسی ارسال نشده است.")
     token = authorization.split(" ", 1)[1].strip()
-    return JwtTokenService().decode_access(token)
+    claims = JwtTokenService().decode_access(token)
+
+    status = await SqlUserStatusQuery(session).status_of(claims.subject_id)
+    if not may_authenticate(status):
+        raise UnauthorizedError("حساب کاربری شما غیرفعال است.")
+    return claims
 
 
-async def get_principal(
-    claims: AccessTokenClaims = Depends(get_access_claims),
-    factory: PrincipalFactory = Depends(get_principal_factory),
-) -> Principal:
-    """The authenticated caller's capability set.
-
-    Not attached to any route yet — route classification and enforcement are
-    Phase 1I/1K. Provided now so Phase 1C onwards has a working seam.
-    """
-    return await factory.from_claims(claims)
+# Principal assembly is deliberately NOT wired here. It needs Merchant's
+# membership resolution as well as Identity's role grants, and Identity must not
+# import Merchant (ADR-0011 §4). The wiring lives in the composition root:
+# `src.api.dependencies.get_principal` / `get_principal_factory`, which consumes
+# `get_access_claims` above.
 
 
 class CurrentUser:

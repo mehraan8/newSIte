@@ -162,6 +162,57 @@ identical for a single vendor, merchant staff, multi-vendor marketplace, a user
 acting for two merchants, and multiple stores per seller. **No ownership rewrite
 is ever required.**
 
+### 7.0 Member roles → seller-scoped permissions (approved Phase 1F)
+
+Earlier revisions named the four member roles but never said what each may do,
+which left the actual authority implicit. This subsection records the approved
+matrix so it is no longer a decision anyone has to re-derive.
+
+| Seller-scoped permission | owner | manager | staff | viewer |
+|---|:--:|:--:|:--:|:--:|
+| `merchant.sellers.read.own` | ● | ● | ● | ● |
+| `merchant.members.read` | ● | ● | | ● |
+| `merchant.sellers.update` | ● | | | |
+| `merchant.members.invite` | ● | | | |
+| `merchant.members.remove` | ● | | | |
+| `selling.offers.read.own` | ● | ● | ● | ● |
+| `selling.offers.create` | ● | ● | ● | |
+| `selling.offers.activate` | ● | ● | | |
+| `selling.offers.suspend` | ● | ● | | |
+| `selling.offers.price.change` | ● | ● | | |
+| `inventory.stock.read.own` | ● | ● | ● | ● |
+| `inventory.stock.receive` | ● | ● | ● | |
+| `inventory.reservations.read` | ● | ● | ● | ● |
+| **total** | **13** | **10** | **6** | **5** |
+
+**Semantics.** `seller_owner` holds the complete seller-scoped set, including
+member management and seller profile updates. `seller_manager` holds commercial
+and operator authority — the full offer lifecycle including price, plus stock —
+but **not** member management and **not** seller profile updates.
+`seller_staff` holds day-to-day operations: create offers, receive stock, read.
+`seller_viewer` is read-only, with no mutation of any kind.
+
+Three boundaries are deliberate and are protected by tests that provably fail if
+removed:
+
+1. **`seller_staff` may not change prices.** Repricing is a commercial decision,
+   not a day-to-day operation.
+2. **`seller_staff` may not activate or suspend offers.** Putting an offer on or
+   off the market is a commercial lifecycle act.
+3. **Member management is owner-only.** A manager cannot grant, revoke or
+   otherwise administer business membership.
+
+**The two vocabularies stay separate.** No member role may hold a
+platform-scoped permission, and no platform role may hold a seller-scoped one
+(§6, §5). The two permission universes are disjoint, member roles are Merchant-
+owned and are *not* rows in the platform `roles` table, and there is no
+`roles.scope` discriminator. A permission reached through this matrix is
+exercisable only via `Principal.can_for_seller`, never through
+`Principal.platform_permissions`.
+
+The matrix lives in `merchant/application/member_permissions.py`, is code-first
+and DB-free, and its `validate()` guard fails the build on drift.
+
 ### 7.1 Seller identity is never derived from a User identity
 
 **`User != Seller`, without exception.** A Seller ID must never be derived from a
@@ -169,14 +220,18 @@ User ID merely because that user created an offer. A User reaches a Seller only
 through a `SellerMember` grant; the seller a caller acts for is chosen from their
 memberships and verified with `can_for_seller`.
 
-**CURRENT STATE (Phase 1 pre-C).** `POST /api/v1/selling/offers` previously set
+**CURRENT STATE (Phase 1G — resolved).** `POST /api/v1/selling/offers` once set
 `seller_id` to the authenticated user's id, collapsing `User == Seller`. That
-derivation has been removed and the endpoint is **deliberately unavailable**
-(`503 capability_unavailable`) until Phase 1G restores it over real memberships.
-Authentication is still enforced, and the request body still refuses a
-caller-supplied `seller_id`. See `src/modules/selling/interface/router.py` and
-`tests/test_seller_identity_boundary.py`, whose source-level guard fails if the
-derivation is reintroduced anywhere in `src/`.
+derivation was removed in Phase 1 pre-C and the endpoint stood at
+`503 capability_unavailable` until Merchant (1C) and membership resolution (1F)
+existed. Phase 1G restored it over real memberships: the caller **nominates** a
+target seller and the nomination is honoured only if it appears in
+`Principal.memberships` with `selling.offers.create` (§9.2).
+
+The source-level guard in `tests/test_seller_identity_boundary.py` still fails if
+the derivation is reintroduced anywhere in `src/`, and
+`tests/test_selling_authorization_guards.py` adds the structural guards that make
+the rule hold for code nobody has written yet.
 
 ### 7.2 Seller identity backfill — corrected
 
@@ -226,6 +281,76 @@ membership revocation follows §10.5 and is not bounded by token TTL. This
 asymmetry is deliberate: roles are coarse and slow-changing; seller authority is
 fine-grained and security-critical.
 
+**ACCOUNT status is a third case, and is NOT bounded by token TTL** (§8.1). A
+valid signature proves the token was issued; it does not prove the account is
+still permitted to act.
+
+### 8.1 Account status — the authentication gate (Phase 1G.1)
+
+`users.status` is authoritative and is read **on every authenticated request**,
+in `src/modules/identity/interface/dependencies.py::get_access_claims`. It is
+never a claim, and putting it in the token is forbidden — a claim is a snapshot
+from before the account was blocked, so trusting one would silently downgrade the
+guarantee to "blocked within one token lifetime".
+
+```text
+bearer header
+  → decode_access        credential: signature, algorithm, type, expiry, shape
+  → users.status         account:    may this subject act AT ALL?
+  → AccessTokenClaims    (both passed)
+  → Principal assembly   ← a blocked caller never gets this far
+```
+
+Two properties make this the whole of the control:
+
+* **One gate.** `get_current_user` and Principal assembly both consume
+  `get_access_claims`, so no route, and no bounded context, holds its own copy of
+  the rule. A guard asserts `decode_access` is called from exactly one place.
+* **Allow-list.** `AUTHENTICABLE_STATUSES == {"active"}`
+  (`identity/domain/entities.py`). `blocked`, `pending`, an unrecognised value,
+  and a missing user row all confer nothing. `User.is_active` delegates to the
+  same predicate, so the aggregate and the gate cannot disagree.
+
+**Refresh is gated too.** `RefreshAccessToken` checks account status before
+minting — after reuse detection, so a blocked user replaying a stolen token still
+burns the family (§8.2). Without this, blocking was cosmetic: the user simply
+refreshed and carried on indefinitely.
+
+**Status code: `401`.** A blocked account is a failure to *authenticate*, not a
+missing permission. `403` would assert the caller is authenticated and merely
+under-privileged, which is false, and would make an account lockout
+indistinguishable from an ordinary authorization denial.
+
+**Cost and residual window.** One primary-key read per authenticated request,
+which is now the only per-request authentication I/O (rate limiting adds one
+Redis round trip on the unauthenticated auth routes only).
+Between that read and the end of the request there is a single-request TOCTOU
+window; the next request is refused. Closing it further would require holding a
+lock across the request, which buys nothing real.
+
+### 8.2 Logout — refresh-family revocation (Phase 1G.1)
+
+`POST /api/v1/auth/logout` revokes the presented refresh token's entire family.
+
+* **Credential: the refresh token**, not the access token. Access tokens are
+  stateless, so the family is the only thing there is to revoke; and possession
+  of a leaked refresh token should be enough to burn it, without also needing a
+  working session.
+* **Scope comes from a signed claim.** `family_id` is read from the
+  cryptographically verified payload, never from a request field, so a caller can
+  only ever end their own session. `revoke_family` filters on that one id.
+* **Idempotent.** Revocation touches only rows with `revoked_at IS NULL`; a
+  repeat logout updates nothing and still returns `204`.
+* **D1 unchanged.** Logout does not alter reuse detection: replaying a consumed
+  token still revokes the family and returns `401`.
+
+**What logout does NOT do: it does not invalidate already-issued access tokens.**
+Nothing in this architecture can — they are stateless and unrevocable until
+expiry. Logout ends the ability to *renew*. Immediate account-level enforcement
+is §8.1's job. The two are separate controls and the ADR does not claim
+otherwise; a test asserts the outstanding access token still works after logout,
+so the limitation is recorded in executable form rather than in prose alone.
+
 ---
 
 ## 9. Ownership strategy
@@ -236,7 +361,7 @@ ORM models.
 | Context | Predicate | Override |
 |---|---|---|
 | Ordering | `order.customer_id == principal.subject_id` | `ordering.orders.read.any` / `cancel.any` |
-| Selling | `principal.can_for_seller(perm, offer.seller_id)` | `selling.offers.manage.any` |
+| Selling | `principal.can_for_seller(perm, offer.seller_id)` — implemented, §9.2 | `selling.offers.manage.any` (platform moderation only; **not** consulted by the seller-member policy) |
 | Inventory | `principal.can_for_seller(perm, stock.seller_id)` — denormalized | `inventory.manage.any` |
 | Merchant | `principal.can_for_seller(perm, seller.id)` | `merchant.sellers.manage.any` |
 | Catalog / BuyBox | none — role-scoped only | — |
@@ -256,11 +381,162 @@ agent to *attempt* cancellation; it does not permit cancelling a PAID order.
 ### 9.1 Status codes
 
 - `401` — unauthenticated
-- `403` — authenticated but lacking the required coarse permission/role
-- `404` — **ownership denial** where resource enumeration must be prevented
-  (orders, offers, stock), indistinguishable from a genuinely missing resource
+- `403` — authenticated but lacking the required permission, **including
+  seller-scoped ownership denial**
+- `404` — the resource genuinely does not exist; also **ownership denial for
+  customer-scoped resources** (orders), where the resource is private and
+  concealing its existence is worth something
 
 Coarse-authorization failure and ownership failure remain distinct outcomes.
+
+> **AMENDED, Phase 1G.** This section previously prescribed `404` for ownership
+> denial on **offers and stock** as well. That is now `403`, for two reasons.
+> First, concealment buys nothing there: an offer is public — the storefront and
+> `GET /api/v1/buybox/variants/{variant_id}` already expose it — so answering
+> `404` to a competitor hides a fact the same competitor can read anonymously,
+> while costing the owner a misleading error. Second, `403` is the convention the
+> API already established for cross-seller access, and §20 of the Phase 1G brief
+> directs that the established convention be followed rather than a new one
+> introduced. Orders keep `404`, where the resource really is private.
+>
+> What does **not** change is that every denial looks the same: one status, one
+> message, no disclosure of the owning seller.
+>
+> **CONFIRMED, Phase 1G.1.** Offer ownership denial is `403`. The reasoning is
+> resource privacy, not convenience: an Offer is already public through the
+> storefront and BuyBox, so `404` conceals nothing an anonymous caller cannot
+> read anyway. Ownership failures are **not** globally normalised to either code.
+>
+> **CORRECTION, security audit.** Earlier revisions of this section stated that
+> Orders answer `404` on ownership denial. **They do not.**
+> `GET /api/v1/orders/{order_id}` raises `ForbiddenError` (403) for another
+> customer's order — see `ordering/interface/router.py`, asserted by
+> `tests/test_ordering_authorization.py`. The ADR described an intention that was
+> never implemented, and this note corrects the record rather than quietly
+> changing either side.
+>
+> The residual exposure is that `403` vs `404` reveals whether an order id
+> exists. Order ids are random UUIDv4, so an attacker must already possess the id
+> for that distinction to tell them anything, and the endpoint denies them either
+> way. Assessed as LOW and left as-is: changing a working, tested API contract is
+> a product decision, not a security necessity. If order-id existence is later
+> judged sensitive, the change is one line plus its test.
+
+### 9.2 Seller-aware offer authorization (implemented, Phase 1G)
+
+Selling's ownership predicate is implemented by one pure function,
+`src/modules/selling/application/policies.py::ensure_can_act_for_seller`:
+
+```text
+target seller -> Principal.memberships[seller] -> SellerGrant.allows(permission)
+```
+
+Everything security-critical is in **where the target seller comes from**, and
+there are exactly two sources — never the caller:
+
+| Operation | Target seller | Required permission |
+|---|---|---|
+| Create offer | the seller **nominated in the request**, honoured only if present in `Principal.memberships` | `selling.offers.create` |
+| Activate offer | `offer.seller_id`, read after loading the offer | `selling.offers.activate` |
+| Suspend offer | `offer.seller_id` | `selling.offers.suspend` |
+| Change price | `offer.seller_id` | `selling.offers.price.change` |
+| Read seller-owned offer | `offer.seller_id` | `selling.offers.read.own` |
+
+**Target-seller selection on create.** `CreateOfferRequest.seller_id` was
+previously banned outright, back when the access token was the only source of
+seller identity. It no longer is: a User is not a Seller, and one User may be
+staff at one seller and manager at another, so there is nothing to infer from and
+the caller has to say which seller the offer is for. The field is a **resource
+selector, never a claim of authority** — naming a stranger's seller, an unknown
+UUID, or one's own user id all resolve to no membership and are denied
+identically. `extra="forbid"` still rejects every other unmodelled field.
+
+**Resource-owner resolution on existing offers.** The offer is loaded first, and
+`offer.seller_id` is the authoritative owner. The caller contributes nothing to
+the answer, so knowing an offer's UUID confers nothing (§9.3).
+
+**Ordering.** Authorization happens after the load and **before any mutation**,
+and on create before the catalog is consulted — so a denial leaves the aggregate
+untouched, emits no event, writes no outbox row, and does not reveal whether a
+variant exists. Enforced structurally by
+`tests/test_selling_authorization_guards.py`.
+
+**One decision per mutation.** The check lives in the use case, not the router.
+The router authenticates, parses, and hands over the `Principal`; there is no
+second, divergent authorization point (ADR principle 5).
+
+**No I/O in the policy.** The function is synchronous and imports no session, no
+repository and no cache. Every fact it needs was resolved once during Principal
+assembly (§10). A guard asserts the module contains no `async`/`await` and no
+infrastructure import, because a policy that *can* query is a policy that
+eventually *will*.
+
+**Platform authority is not seller authority.** `selling.offers.manage.any` is
+deliberately **not** consulted here. It is platform moderation, a separate
+universe; honouring it would let a platform role act *as* a seller member.
+
+### 9.3 IDOR protection
+
+The threat: an authenticated caller mutating another seller's offer by knowing
+its UUID. Resolved by the ordering above, and locked by tests at three levels —
+unit (`tests/test_selling_offer_authorization.py`), real PostgreSQL
+(`tests/integration/test_selling_offer_ownership.py`) and real HTTP
+(`tests/api/test_selling_authorization.py`) — each asserting both the refusal and
+that the row, the price and the status are unchanged.
+
+Denials are **indistinguishable**: no membership, an inactive membership, a
+non-active seller, and a role that lacks the permission all produce one identical
+`403`, and the response never names the owning seller. Distinguishable messages
+would turn a denial into an enumeration oracle.
+
+
+### 9.4 Back-office authorization (security audit)
+
+Layer 3 of the four-layer model — the router coarse check — existed in the design
+from §3 but had never been wired. Catalog admin and Inventory therefore shipped
+with **authentication only**, which a live probe confirmed was exploitable by any
+logged-in customer: creating and editing catalogue products, injecting stock
+against another seller's offer, and committing or releasing any reservation by
+id. Authentication is not authorization, and a route named `/admin/` is not a
+guard.
+
+`src/api/guards.py::require_permission` implements layer 3. It takes `Permission`
+members, not strings, so a typo fails at import rather than matching nothing and
+admitting everyone.
+
+| Operation | Control | Required |
+|---|---|---|
+| `POST /catalog/admin/products` | router guard | `catalog.products.create` |
+| `PATCH /catalog/admin/products/{id}` | router guard | `catalog.products.update` |
+| `POST /inventory/stock` | **object policy** | `inventory.stock.receive` for the OFFER's seller, or platform `inventory.manage.any` |
+| `POST /inventory/reservations` | router guard | `inventory.reservations.create` |
+| `POST /inventory/reservations/{id}/commit` | router guard | `inventory.reservations.commit` |
+| `POST /inventory/reservations/{id}/release` | router guard | `inventory.reservations.release` |
+
+**Why stock is not a router guard.** Stock belongs to the offer's seller, and the
+router has not loaded the offer — the same reason Selling decides ownership in
+its use case (§3.2). `inventory/application/policies.py` holds the decision;
+`SellingGateway.seller_of` supplies the owner through the existing ACL, so
+Inventory still never imports Selling. It replaces the previous `offer_exists`
+call in that path rather than adding one: a `None` return answers both "does it
+exist" and "who owns it" in a single round trip.
+
+**Why reservations are not seller-scoped.** A reservation is not a merchant-owned
+resource. In normal operation the Ordering saga creates and commits them
+in-process; the HTTP routes exist for back-office correction, so they carry
+platform permissions and no seller reaches them.
+
+**The one deliberate override.** `inventory.manage.any` lets an operator correct
+stock they do not own. It is written at the policy's call site, not hidden inside
+`can_for_seller`, so the widening is visible where it is granted — and it is the
+*only* platform override in the seller-scoped surface. Selling grants none.
+
+**A guard that locks out the right people is also a defect.** The first draft
+placed a router-wide `catalog.products.read` requirement on the catalog admin
+router; that permission belongs to `super_admin` alone in the Phase 1E baseline,
+so it would have barred `catalog_admin` from its own endpoints. Caught by the
+"legitimate role still works" counterweight test, which is why every guard here
+has one.
 
 ---
 

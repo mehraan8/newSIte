@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import ClassVar
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.config.env_bootstrap import load_env
@@ -43,6 +44,10 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
 
     # --- Auth / JWT ---
+    # The default is a DEVELOPMENT placeholder and is refused outside development
+    # by `_reject_insecure_defaults` below. It is published in this file, so a
+    # deployment that silently fell back to it would let anyone who has read the
+    # repository mint a token for any user, with any role.
     jwt_secret: str = "change-me-in-production"  # noqa: S105 - dev default only
     jwt_algorithm: str = "HS256"
     access_token_ttl_seconds: int = 15 * 60          # 15 minutes
@@ -53,6 +58,8 @@ class Settings(BaseSettings):
     otp_ttl_seconds: int = 120
     otp_max_attempts: int = 5
     otp_resend_cooldown_seconds: int = 60
+    # Same contract as jwt_secret: a published default, refused outside
+    # development. A known pepper makes the stored OTP hashes precomputable.
     otp_pepper: str = "change-me-otp-pepper"  # noqa: S105 - dev default only
     sms_provider: str = "console"  # console | kavenegar | smsir
 
@@ -60,6 +67,77 @@ class Settings(BaseSettings):
     # Configurable invariant: at most one ACTIVE offer per seller per variant.
     # True = single-offer mode (default); False = marketplace multi-offer mode.
     selling_one_active_offer_per_variant: bool = True
+
+    # --- Abuse protection (Redis-backed, fail-closed) ---
+    # Per-IP ceilings on the unauthenticated auth surface. The per-mobile OTP
+    # cooldown already existed and is unchanged; it did nothing against an
+    # attacker who simply varies the number, which is how SMS-bombing and SMS
+    # cost-inflation attacks work.
+    otp_request_ip_limit: int = 10
+    otp_request_ip_window_seconds: int = 600
+    otp_verify_ip_limit: int = 20
+    otp_verify_ip_window_seconds: int = 600
+    # Guessing a refresh token is infeasible, so this is a resource-exhaustion
+    # ceiling rather than a brute-force one: every attempt costs a DB round trip.
+    refresh_ip_limit: int = 30
+    refresh_ip_window_seconds: int = 600
+
+    # --- OTP delivery (development only) ---
+    # The console sender writes the OTP to the application log. That is a
+    # credential in a log file, so it is OFF unless switched on deliberately, and
+    # refused outside development entirely (see the validator below). Without
+    # this flag the console sender logs only that a code was sent.
+    otp_log_codes: bool = False
+
+    # --- Values a production deployment must not be allowed to inherit --------
+    # Keyed by attribute name so the message can name the environment variable.
+    INSECURE_DEFAULTS: ClassVar[dict[str, str]] = {
+        "jwt_secret": "change-me-in-production",
+        "otp_pepper": "change-me-otp-pepper",
+    }
+    #: Environments where the published development defaults are acceptable.
+    DEV_ENVIRONMENTS: ClassVar[frozenset[str]] = frozenset({"development", "test", "local"})
+
+    @property
+    def is_development(self) -> bool:
+        return self.environment.strip().lower() in self.DEV_ENVIRONMENTS
+
+    @model_validator(mode="after")
+    def _reject_insecure_defaults(self) -> "Settings":
+        """Fail to boot rather than run production on a published secret.
+
+        A missing environment variable is the normal way this goes wrong: nothing
+        errors, the placeholder is used, and every token in the system becomes
+        forgeable by anyone who can read this file. Refusing at import time turns
+        a silent, total compromise into a loud deployment failure.
+
+        Length is checked too: HS256 with a short key is brute-forceable offline
+        from a single captured token, and RFC 7518 §3.2 requires at least as many
+        bits of key as the hash outputs.
+        """
+        if self.is_development:
+            return self
+
+        problems = [
+            f"{name.upper()} is still the published development default"
+            for name, default in self.INSECURE_DEFAULTS.items()
+            if getattr(self, name) == default
+        ]
+        if len(self.jwt_secret) < 32:
+            problems.append("JWT_SECRET is shorter than the 32 bytes HS256 requires")
+        if len(self.otp_pepper) < 16:
+            problems.append("OTP_PEPPER is shorter than 16 characters")
+        if self.otp_log_codes:
+            problems.append("OTP_LOG_CODES is enabled, which writes OTP codes to the log")
+        if self.debug:
+            problems.append("DEBUG is enabled")
+
+        if problems:
+            raise ValueError(
+                f"refusing to start in environment={self.environment!r}: "
+                + "; ".join(problems)
+            )
+        return self
 
 
 @lru_cache

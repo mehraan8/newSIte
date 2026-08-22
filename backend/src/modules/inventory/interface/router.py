@@ -5,6 +5,22 @@ in-process via the use cases rather than over HTTP.
 
 Authentication is enforced here rather than delegated to a gateway: no gateway
 exists in this deployment, and these routes mutate sellable stock.
+
+AUTHENTICATION alone was not enough, and for a while that is all these routes
+had. The security audit confirmed that any logged-in customer could inject stock
+against another seller's offer, reserve that seller's stock, and commit or
+release ANY reservation by guessing nothing more than its id.
+
+Two different controls now apply, because the operations are different kinds:
+
+  * `POST /stock` is SELLER-SCOPED. The stock belongs to the offer's seller, so
+    ownership is resolved from the offer and checked in the use case — a router
+    guard cannot do it, because the router has not loaded the offer.
+  * reservations are PLATFORM/INTERNAL. In normal operation the Ordering saga
+    creates and commits them in-process; the HTTP routes exist for back-office
+    correction, so they demand a platform permission and no seller can reach
+    them. Guarding them per-reservation would be the wrong model — a reservation
+    is not a merchant-owned resource.
 """
 
 from __future__ import annotations
@@ -14,7 +30,10 @@ import uuid
 from fastapi import APIRouter, Depends, status
 from pydantic import BaseModel, Field
 
-from src.modules.identity.interface.dependencies import get_current_user
+from src.api.dependencies import get_principal
+from src.api.guards import require_permission
+from src.shared_kernel.application.permissions import Permission
+from src.shared_kernel.application.security import Principal
 
 from src.modules.inventory.application.dtos import (
     ReceiveStockCommand,
@@ -29,11 +48,12 @@ from src.modules.inventory.application.use_cases import (
 from src.modules.inventory.infrastructure.selling_acl import SqlSellingGateway
 from src.modules.inventory.infrastructure.unit_of_work import SqlAlchemyInventoryUnitOfWork
 
+# Authentication is mandatory for every route on this router — a floor, so a
+# route added without its own guard still cannot be reached anonymously.
 router = APIRouter(
     prefix="/inventory",
     tags=["inventory"],
-    # Authentication is mandatory for every route on this router.
-    dependencies=[Depends(get_current_user)],
+    dependencies=[Depends(get_principal)],
 )
 
 
@@ -72,15 +92,27 @@ class ReserveStockBody(BaseModel):
 
 
 @router.post("/stock", status_code=status.HTTP_200_OK)
-async def receive_stock(body: ReceiveStockBody, uc: ReceiveStock = Depends(get_receive)):
+async def receive_stock(
+    body: ReceiveStockBody,
+    principal: Principal = Depends(get_principal),
+    uc: ReceiveStock = Depends(get_receive),
+):
+    """Seller-scoped: the use case resolves the offer's owner and checks the
+    caller's membership (or platform `inventory.manage.any`) before touching a
+    counter."""
     return await uc.execute(
         ReceiveStockCommand(
             offer_id=str(body.offer_id), location=body.location, quantity=body.quantity
-        )
+        ),
+        principal,
     )
 
 
-@router.post("/reservations", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/reservations",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission(Permission.INVENTORY_RESERVATIONS_CREATE))],
+)
 async def reserve(body: ReserveStockBody, uc: ReserveStock = Depends(get_reserve)):
     return await uc.execute(
         ReserveStockCommand(
@@ -90,11 +122,17 @@ async def reserve(body: ReserveStockBody, uc: ReserveStock = Depends(get_reserve
     )
 
 
-@router.post("/reservations/{reservation_id}/commit")
+@router.post(
+    "/reservations/{reservation_id}/commit",
+    dependencies=[Depends(require_permission(Permission.INVENTORY_RESERVATIONS_COMMIT))],
+)
 async def commit(reservation_id: uuid.UUID, uc: CommitReservation = Depends(get_commit)):
     return await uc.execute(reservation_id)
 
 
-@router.post("/reservations/{reservation_id}/release")
+@router.post(
+    "/reservations/{reservation_id}/release",
+    dependencies=[Depends(require_permission(Permission.INVENTORY_RESERVATIONS_RELEASE))],
+)
 async def release(reservation_id: uuid.UUID, uc: ReleaseReservation = Depends(get_release)):
     return await uc.execute(reservation_id)

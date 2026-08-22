@@ -36,3 +36,17 @@ class SellingGateway(Protocol):
     """Read-only ACL to Selling — the only way Inventory references an offer."""
 
     async def offer_exists(self, offer_id: uuid.UUID) -> bool: ...
+
+    async def seller_of(self, offer_id: uuid.UUID) -> uuid.UUID | None:
+        """The seller that owns the offer, or None if the offer does not exist.
+
+        Stock is anchored on `offer_id` and carries no seller of its own, so this
+        is how Inventory learns who a receive would credit. Reading it through
+        the existing ACL rather than joining to `offers` keeps the boundary
+        intact: on extraction this becomes one HTTP call, not a schema change.
+
+        ADR-0011 §9 records `inventory_stock.seller_id` as the TARGET STATE
+        denormalization. Until that column exists this resolves per request; the
+        authorization semantics are identical either way.
+        """
+        ...

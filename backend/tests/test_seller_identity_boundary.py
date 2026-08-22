@@ -1,18 +1,21 @@
-"""The User/Seller identity boundary (ADR-0011 §7, Phase 1 pre-C).
+"""The User/Seller identity boundary (ADR-0011 §7, Phases pre-C … 1G).
 
 `User != Seller`. A User is a person; a Seller is a business owned by Merchant; a
 User reaches a Seller only through a SellerMember grant.
 
-Until Merchant (1C) and membership resolution (1F) exist there is no legitimate
-way to derive `Principal -> SellerMember -> Seller.id`, so offer creation is
-deliberately unavailable rather than minting `seller_id = user.id`.
+Phase 1G closed the last gap. Offer creation, which stood at 503 while there was
+no honest source for `seller_id`, now takes the seller from the caller's
+memberships — so the assertions that pinned the 503 have been replaced by ones
+that pin the thing the 503 was protecting. What has NOT changed is the rule:
+nothing anywhere may turn a user id into a seller id.
 
-These tests are the regression lock. The source-level guard below is the one that
-matters most: it fails no matter WHERE someone reintroduces the collapse, not
-just in the router it was removed from.
+The source-level guard at the bottom is the one that matters most: it fails no
+matter WHERE someone reintroduces the collapse, not just in the router it was
+removed from. The behavioural half — that a caller cannot obtain seller authority
+they do not hold — lives in tests/test_selling_offer_authorization.py and
+tests/api/test_selling_authorization.py.
 
-DB-free: the blocked route raises before touching a session, and authentication
-is JWT-only.
+DB-free: everything here is either structural or refused before a session opens.
 """
 
 from __future__ import annotations
@@ -69,54 +72,53 @@ BODY = {"variant_id": str(uuid.uuid4()), "condition": "new",
         "currency": "IRR", "amount": 1000, "scale": 0}
 
 
-# --- A. no caller-supplied seller identity ---------------------------------
-def test_request_schema_has_no_seller_id_field():
-    assert "seller_id" not in CreateOfferRequest.model_fields
+# --- A. seller_id is a SELECTOR, and only a selector -----------------------
+def test_seller_id_is_a_request_field_again_but_selects_rather_than_grants():
+    """Phase 1G reinstated the field. That is safe only because the value is
+    proved against `Principal.memberships` before anything is created — see
+    tests/test_selling_offer_authorization.py::test_case_b_*, which shows that
+    naming a seller you are not a member of creates nothing."""
+    assert "seller_id" in CreateOfferRequest.model_fields
+    assert CreateOfferRequest.model_fields["seller_id"].annotation is uuid.UUID
 
 
-def test_body_supplied_seller_id_is_rejected_not_ignored():
-    """Silently ignoring it would hide an attempted impersonation."""
+def test_creation_still_refuses_every_other_unexpected_field():
+    """extra="forbid" is still on: the schema names exactly what the server
+    models, so a typo'd or smuggled field is a 422 rather than silent input."""
     with pytest.raises(Exception) as exc:
-        CreateOfferRequest(seller_id=str(uuid.uuid4()), **BODY)
-    assert "seller_id" in str(exc.value)
+        CreateOfferRequest(seller_id=uuid.uuid4(), user_id=str(uuid.uuid4()), **BODY)
+    assert "user_id" in str(exc.value)
 
 
-def test_body_supplied_seller_id_is_rejected_over_http():
-    resp = call("POST", OFFERS, json={**BODY, "seller_id": str(uuid.uuid4())},
-                headers={"Authorization": f"Bearer {access_token(uuid.uuid4())}"})
-    assert resp.status_code == 422, resp.text
-    assert "seller_id" in resp.text
-
-
-# --- B. the user-id-as-seller path no longer creates anything --------------
-def test_create_offer_no_longer_receives_the_authenticated_user():
-    """Structural: the collapse is impossible because the handler no longer has
-    a CurrentUser to take an id from."""
+# --- B. the user-id-as-seller path is structurally impossible --------------
+def test_create_offer_does_not_receive_the_authenticated_user():
+    """Structural: the handler has a Principal, never a CurrentUser, so there is
+    no user id in scope to assign to a seller. The collapse cannot be written
+    here without first adding a parameter."""
     params = inspect.signature(selling_router.create_offer).parameters
     assert "current" not in params
-    assert set(params) == {"body"}
+    assert set(params) == {"body", "principal", "uc"}
 
 
-def test_create_offer_raises_capability_unavailable():
-    with pytest.raises(CapabilityUnavailableError):
-        run(selling_router.create_offer(CreateOfferRequest(**BODY)))
+def test_every_selling_route_takes_the_principal_not_a_user():
+    for name in ("create_offer", "activate_offer", "suspend_offer", "change_offer_price"):
+        params = inspect.signature(getattr(selling_router, name)).parameters
+        assert "principal" in params, name
+        assert "current" not in params, name
 
 
-def test_authenticated_offer_creation_returns_503_and_creates_nothing():
-    resp = call("POST", OFFERS, json=BODY,
-                headers={"Authorization": f"Bearer {access_token(uuid.uuid4())}"})
-    assert resp.status_code == 503, resp.text
-    assert resp.json()["title"] == "capability_unavailable"
-
-
-def test_anonymous_offer_creation_still_fails_authentication_first():
-    """The block must not become an authentication bypass: no credential still
-    means 401, not 503."""
-    resp = call("POST", OFFERS, json=BODY)
+def test_anonymous_offer_creation_fails_authentication_first():
+    """Authorization must never be reachable without authentication: no
+    credential is 401, not 403 — a missing credential is not a permission
+    problem, and answering 403 would tell an anonymous prober that the seller
+    they named exists."""
+    resp = call("POST", OFFERS, json={**BODY, "seller_id": str(uuid.uuid4())})
     assert resp.status_code == 401, resp.text
 
 
-def test_capability_unavailable_is_a_mapped_application_error():
+def test_capability_unavailable_remains_a_mapped_application_error():
+    """The 503 is no longer used by Selling, but the error type stays part of the
+    taxonomy — the next capability to land dark needs it."""
     assert issubclass(CapabilityUnavailableError, AppError)
     assert CapabilityUnavailableError.http_status == 503
     assert CapabilityUnavailableError.code == "capability_unavailable"

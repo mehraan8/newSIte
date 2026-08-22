@@ -41,6 +41,8 @@ from src.shared_kernel.application.errors import (
     ConflictError,
     NotFoundError,
 )
+from src.shared_kernel.application.permissions import Permission
+from src.shared_kernel.application.security import Principal
 from src.shared_kernel.domain.base import utcnow
 from src.shared_kernel.infrastructure.outbox.serialization import event_payload
 
@@ -202,6 +204,22 @@ class FakeSelling:
     async def offer_exists(self, offer_id):
         return offer_id in (OFFER, OFFER2)
 
+    async def seller_of(self, offer_id):
+        return SELLER if offer_id in (OFFER, OFFER2) else None
+
+
+SELLER = uuid.uuid4()
+# These suites validate the inventory LIFECYCLE, not authorization, so their
+# principal is a platform operator holding `inventory.manage.any`. Authorization
+# itself is proved in tests/test_inventory_authorization.py and
+# tests/api/test_admin_authorization.py; here it must simply not get in the way,
+# and passing a real Principal keeps this exercising the same code path rather
+# than a bypass.
+OPERATOR = Principal(
+    subject_id=uuid.uuid4(),
+    platform_permissions=frozenset({Permission.INVENTORY_MANAGE_ANY}),
+)
+
 
 def build(store: Store):
     factory = lambda: FakeInvUoW(store)  # noqa: E731
@@ -220,7 +238,7 @@ def stocked(qty: int = 10, offer=OFFER) -> tuple[Store, dict]:
     store = Store()
     ucs = build(store)
     run(ucs["receive"].execute(
-        ReceiveStockCommand(offer_id=str(offer), location=LOC, quantity=qty)))
+        ReceiveStockCommand(offer_id=str(offer), location=LOC, quantity=qty), OPERATOR))
     return store, ucs
 
 
@@ -523,7 +541,7 @@ def test_one_reservations_conflict_does_not_roll_back_another():
     pass when a single item was contended."""
     store, ucs = stocked(10)
     run(ucs["receive"].execute(
-        ReceiveStockCommand(offer_id=str(OFFER2), location=LOC, quantity=10)))
+        ReceiveStockCommand(offer_id=str(OFFER2), location=LOC, quantity=10), OPERATOR))
 
     good = expired_reservation(store, ucs, qty=4, offer=OFFER)
     store.reservations[good]["expires_at"] = utcnow() - timedelta(seconds=99)  # swept first
@@ -688,7 +706,7 @@ def test_sweeper_skips_a_reservation_the_domain_refuses_and_keeps_going():
     and must not block the younger rows behind it (claims are oldest-first)."""
     store, ucs = stocked(10)
     run(ucs["receive"].execute(
-        ReceiveStockCommand(offer_id=str(OFFER2), location=LOC, quantity=10)))
+        ReceiveStockCommand(offer_id=str(OFFER2), location=LOC, quantity=10), OPERATOR))
 
     bad = expired_reservation(store, ucs, qty=4, offer=OFFER)
     store.reservations[bad]["expires_at"] = utcnow() - timedelta(seconds=99)  # claimed first

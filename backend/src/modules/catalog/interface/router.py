@@ -21,10 +21,15 @@ def _repo(session: AsyncSession = Depends(get_session)) -> CatalogReadRepository
 
 @router.get("/products", response_model=ProductListOut)
 async def list_products(
-    type: str | None = Query(default=None, description="product_type code"),
-    category: str | None = Query(default=None),
-    brand: str | None = Query(default=None),
-    q: str | None = Query(default=None, description="search by name"),
+    # Length caps on a PUBLIC, unauthenticated endpoint. `q` was unbounded, so a
+    # multi-megabyte query string became a multi-megabyte pattern match against
+    # every active product — cheap to send, expensive to serve. The filter codes
+    # compare for equality and so are cheap, but are capped to the column widths
+    # they are matched against for the same reason.
+    type: str | None = Query(default=None, max_length=64, description="product_type code"),
+    category: str | None = Query(default=None, max_length=200),
+    brand: str | None = Query(default=None, max_length=200),
+    q: str | None = Query(default=None, max_length=100, description="search by name"),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     repo: CatalogReadRepository = Depends(_repo),

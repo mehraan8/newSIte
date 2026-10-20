@@ -65,8 +65,19 @@ class PlaceOrder:
 
     async def execute(self, cmd: PlaceOrderCommand) -> OrderView:
         customer_id = uuid.UUID(cmd.customer_id)
-        # Priced before the transaction opens. A replay re-prices needlessly but
-        # harmlessly — the stored order keeps its ORIGINAL snapshot.
+        # A replay is answered BEFORE pricing. The offer may have been suspended
+        # or repriced since the original request; re-pricing first would turn a
+        # retry of a successfully placed order into a 409/404, and the client
+        # would conclude the order failed and place it again.
+        if cmd.idempotency_key:
+            uow = self._uow_factory()
+            async with uow:
+                replay = await self._replay(uow, customer_id, cmd)
+            if replay is not None:
+                return replay
+
+        # Priced before the write transaction opens. The replay check inside
+        # `op` still runs: a concurrent duplicate may commit in between.
         lines = await self._resolve_lines(cmd)
 
         async def op() -> OrderView:

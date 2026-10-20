@@ -193,6 +193,59 @@ def test_a_retried_checkout_returns_the_original_order():
     assert len(store.orders) == 1
 
 
+class TogglePricing:
+    """Pricing whose answer can change between the original request and its retry."""
+
+    def __init__(self) -> None:
+        self.active = True
+        self.calls = 0
+
+    async def price_for(self, offer_id, region):
+        self.calls += 1
+        return OfferPriceSnapshot(
+            offer_id=offer_id, region=region, currency="IRR",
+            amount=PRICE, scale=0, is_active=self.active,
+        )
+
+
+def test_a_retry_after_the_offer_is_suspended_still_returns_the_original_order():
+    """The order was placed; the offer went inactive afterwards. A retry must
+    report the order that exists, not 409 "not orderable" — a client told its
+    order failed will place it again."""
+    store, pricing = Store(), TogglePricing()
+    uc = PlaceOrder(uow_factory=lambda: FakeUoW(store), pricing=pricing)
+
+    first = run(uc.execute(cmd()))
+    pricing.active = False
+    second = run(uc.execute(cmd()))
+
+    assert second.id == first.id
+    assert len(store.orders) == 1
+
+
+def test_a_replay_is_answered_without_repricing():
+    store, pricing = Store(), TogglePricing()
+    uc = PlaceOrder(uow_factory=lambda: FakeUoW(store), pricing=pricing)
+
+    run(uc.execute(cmd()))
+    calls_after_first = pricing.calls
+    run(uc.execute(cmd()))
+
+    assert pricing.calls == calls_after_first
+
+
+def test_a_reused_key_with_a_different_body_is_rejected_even_if_the_offer_is_gone():
+    """Answering replays early must not skip the fingerprint check."""
+    store, pricing = Store(), TogglePricing()
+    uc = PlaceOrder(uow_factory=lambda: FakeUoW(store), pricing=pricing)
+
+    run(uc.execute(cmd(quantity=1)))
+    pricing.active = False
+    with pytest.raises(ConflictError):
+        run(uc.execute(cmd(quantity=2)))
+    assert len(store.orders) == 1
+
+
 def test_a_retried_checkout_does_not_place_a_second_reservation():
     """The actual harm: a second order means a second set of reservation_ids and
     a second hold on the same stock."""

@@ -35,6 +35,8 @@ from src.shared_kernel.application.errors import (
     NotFoundError,
     ValidationError,
 )
+from src.shared_kernel.application.permissions import Permission
+from src.shared_kernel.application.platform_policy import ensure_can_platform
 from src.shared_kernel.application.security import Principal
 from src.shared_kernel.domain.base import utcnow
 
@@ -106,7 +108,19 @@ class ReserveStock:
     def __init__(self, uow_factory: UowFactory) -> None:
         self._uow_factory = uow_factory
 
-    async def execute(self, cmd: ReserveStockCommand) -> ReservationView:
+    async def execute(
+        self, cmd: ReserveStockCommand, principal: Principal
+    ) -> ReservationView:
+        """Operator-facing. The saga reserves through `ReserveForOrder`, which is
+        event-driven and has no caller to authorize.
+
+        A reservation is not a merchant-owned resource — it belongs to the order
+        flow — so this is platform authority, not a seller membership.
+        """
+        # AUTHORIZE FIRST: before the idempotency read, so a stranger cannot use
+        # the difference between "already exists" and "not found" as an oracle.
+        ensure_can_platform(principal, Permission.INVENTORY_RESERVATIONS_CREATE)
+
         reservation_id = uuid.UUID(cmd.reservation_id)
         offer_id = uuid.UUID(cmd.offer_id)
 
@@ -143,7 +157,15 @@ class CommitReservation:
     def __init__(self, uow_factory: UowFactory) -> None:
         self._uow_factory = uow_factory
 
-    async def execute(self, reservation_id: uuid.UUID) -> ReservationView:
+    async def execute(
+        self, reservation_id: uuid.UUID, principal: Principal
+    ) -> ReservationView:
+        """Operator-facing. The saga commits through `CommitForOrder`, whose
+        failure protocol differs (it replies with a fact rather than raising)."""
+        # AUTHORIZE FIRST — before the load, so the 404 cannot be used to
+        # enumerate reservation ids, and no state can change ahead of the check.
+        ensure_can_platform(principal, Permission.INVENTORY_RESERVATIONS_COMMIT)
+
         async def op() -> ReservationView:
             uow = self._uow_factory()
             async with uow:
@@ -237,10 +259,39 @@ class CommitForOrder:
 
 
 class ReleaseReservation:
+    """Operator-facing release. Requires `inventory.reservations.release`.
+
+    This used to serve two trust contexts at once: an authenticated operator over
+    HTTP, and the saga's compensation path via `OnInventoryReleaseRequested`.
+    Attaching a mandatory Principal would have broken compensation, and
+    authorizing on the `reason` string would have been authorization by a
+    caller-supplied value — the wrong shape entirely.
+
+    So the saga path moved to `ReleaseForOrder`, mirroring the split the module
+    already makes for reserve (`ReserveForOrder`) and commit (`CommitForOrder`).
+    One class, one trust context.
+    """
+
     def __init__(self, uow_factory: UowFactory) -> None:
         self._uow_factory = uow_factory
 
-    async def execute(self, reservation_id: uuid.UUID, *, reason: str = "manual") -> ReservationView:
+    async def execute(
+        self, reservation_id: uuid.UUID, principal: Principal, *, reason: str = "manual"
+    ) -> ReservationView:
+        # AUTHORIZE FIRST — before the load, for the same reasons as commit.
+        ensure_can_platform(principal, Permission.INVENTORY_RESERVATIONS_RELEASE)
+        return await self.release_unchecked(reservation_id, reason=reason)
+
+    async def release_unchecked(
+        self, reservation_id: uuid.UUID, *, reason: str
+    ) -> ReservationView:
+        """The release mechanics, WITHOUT any authorization.
+
+        Named for what it does not do. The only legitimate callers are
+        `execute` above, which authorizes first, and `ReleaseForOrder`, which
+        runs in the relay where there is no caller to authorize. Anything else
+        reaching for this is skipping a check.
+        """
         async def op() -> ReservationView:
             uow = self._uow_factory()
             async with uow:
@@ -268,6 +319,32 @@ class ReleaseReservation:
                 return ReservationView.from_domain(res)
 
         return await _with_retry(op)
+
+
+class ReleaseForOrder:
+    """Saga participant for ordering.InventoryReleaseRequested.
+
+    No Principal, and none to ask for: this runs in the relay, reacting to an
+    event only the outbox can deliver. There is no caller whose authority could
+    be checked, and inventing a "system principal" to satisfy a signature would
+    create exactly the bypass primitive the architecture avoids — anything able
+    to construct one would hold every permission.
+
+    The authorization boundary for this path is the event itself. Only Ordering
+    emits `InventoryReleaseRequested`, and it does so only for reservations its
+    own saga created.
+
+    Shares the release mechanics with `ReleaseReservation` rather than
+    duplicating them, so the two cannot drift apart.
+    """
+
+    def __init__(self, uow_factory: UowFactory) -> None:
+        self._operator = ReleaseReservation(uow_factory)
+
+    async def execute(
+        self, reservation_id: uuid.UUID, *, reason: str = "compensation"
+    ) -> ReservationView:
+        return await self._operator.release_unchecked(reservation_id, reason=reason)
 
 
 class ReserveForOrder:

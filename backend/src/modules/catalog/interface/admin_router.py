@@ -11,8 +11,17 @@ permission for the operation it performs, checked from the assembled Principal
 before the use case runs.
 
 The permissions are deliberately per-operation rather than one blanket
-"catalog admin" grant: `catalog_admin` holds both, but a future read-only or
-publish-only role needs the distinction to exist.
+"catalog admin" grant: `catalog_admin` holds them all today, but a future
+read-only or publish-only role needs the distinction to exist.
+
+Phase 1H moved the authoritative decision into the USE CASE. The router guards
+below remain as a coarse floor — they reject the obviously-unauthorized before a
+session is opened — but they are not what makes the operation safe. A router
+guard protects a route; it protects nothing when the use case is called from a
+consumer, a CLI or a test. `UpdateProduct` also needs the finer decision the
+router cannot make: whether the request PUBLISHES or ARCHIVES, which depends on
+the body and demands `catalog.products.publish` / `.archive` rather than
+`.update`.
 """
 
 from __future__ import annotations
@@ -24,6 +33,7 @@ from fastapi import APIRouter, Depends, status
 from src.api.dependencies import get_principal
 from src.api.guards import require_permission
 from src.shared_kernel.application.permissions import Permission
+from src.shared_kernel.application.security import Principal
 
 from src.modules.catalog.application.write_dtos import (
     CreateProductCommand,
@@ -70,6 +80,7 @@ def get_update_product() -> UpdateProduct:
 )
 async def create_product(
     body: CreateProductRequest,
+    principal: Principal = Depends(get_principal),
     uc: CreateProduct = Depends(get_create_product),
 ) -> ProductResponse:
     cmd = CreateProductCommand(
@@ -85,7 +96,7 @@ async def create_product(
             for v in body.variants
         ),
     )
-    return ProductResponse.from_view(await uc.execute(cmd))
+    return ProductResponse.from_view(await uc.execute(cmd, principal))
 
 
 @router.patch(
@@ -96,8 +107,12 @@ async def create_product(
 async def update_product(
     product_id: uuid.UUID,
     body: UpdateProductRequest,
+    principal: Principal = Depends(get_principal),
     uc: UpdateProduct = Depends(get_update_product),
 ) -> ProductResponse:
+    """Requires `catalog.products.update` to edit attributes, and additionally
+    `.publish` or `.archive` when the request changes status — the router guard
+    below cannot see the body, so the use case makes that call."""
     cmd = UpdateProductCommand(
         name_fa=body.name_fa,
         description=body.description,
@@ -106,4 +121,4 @@ async def update_product(
         is_featured=body.is_featured,
         status=body.status,
     )
-    return ProductResponse.from_view(await uc.execute(product_id, cmd))
+    return ProductResponse.from_view(await uc.execute(product_id, cmd, principal))

@@ -21,6 +21,11 @@ Two different controls now apply, because the operations are different kinds:
     correction, so they demand a platform permission and no seller can reach
     them. Guarding them per-reservation would be the wrong model — a reservation
     is not a merchant-owned resource.
+
+Phase 1H moved the authoritative decision into the USE CASES. The router guards
+below stay as a coarse floor, but they are not what makes these safe: a router
+guard protects a route, not an operation, and these use cases are also reachable
+from consumers and tests.
 """
 
 from __future__ import annotations
@@ -113,12 +118,17 @@ async def receive_stock(
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_permission(Permission.INVENTORY_RESERVATIONS_CREATE))],
 )
-async def reserve(body: ReserveStockBody, uc: ReserveStock = Depends(get_reserve)):
+async def reserve(
+    body: ReserveStockBody,
+    principal: Principal = Depends(get_principal),
+    uc: ReserveStock = Depends(get_reserve),
+):
     return await uc.execute(
         ReserveStockCommand(
             reservation_id=str(body.reservation_id), offer_id=str(body.offer_id),
             location=body.location, quantity=body.quantity, ttl_seconds=body.ttl_seconds,
-        )
+        ),
+        principal,
     )
 
 
@@ -126,13 +136,21 @@ async def reserve(body: ReserveStockBody, uc: ReserveStock = Depends(get_reserve
     "/reservations/{reservation_id}/commit",
     dependencies=[Depends(require_permission(Permission.INVENTORY_RESERVATIONS_COMMIT))],
 )
-async def commit(reservation_id: uuid.UUID, uc: CommitReservation = Depends(get_commit)):
-    return await uc.execute(reservation_id)
+async def commit(
+    reservation_id: uuid.UUID,
+    principal: Principal = Depends(get_principal),
+    uc: CommitReservation = Depends(get_commit),
+):
+    return await uc.execute(reservation_id, principal)
 
 
 @router.post(
     "/reservations/{reservation_id}/release",
     dependencies=[Depends(require_permission(Permission.INVENTORY_RESERVATIONS_RELEASE))],
 )
-async def release(reservation_id: uuid.UUID, uc: ReleaseReservation = Depends(get_release)):
-    return await uc.execute(reservation_id)
+async def release(
+    reservation_id: uuid.UUID,
+    principal: Principal = Depends(get_principal),
+    uc: ReleaseReservation = Depends(get_release),
+):
+    return await uc.execute(reservation_id, principal)

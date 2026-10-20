@@ -131,7 +131,12 @@ def drain_relay(max_passes: int = 12) -> int:
 # than a bypass.
 OPERATOR = Principal(
     subject_id=uuid.uuid4(),
-    platform_permissions=frozenset({Permission.INVENTORY_MANAGE_ANY}),
+    platform_permissions=frozenset({
+        Permission.INVENTORY_MANAGE_ANY,
+        Permission.INVENTORY_RESERVATIONS_CREATE,
+        Permission.INVENTORY_RESERVATIONS_COMMIT,
+        Permission.INVENTORY_RESERVATIONS_RELEASE,
+    }),
 )
 
 
@@ -182,7 +187,7 @@ def test_reserve_success_persists_counters_reservation_and_event(offer_id):
     rid = uuid.uuid4()
 
     with system_event_context(region="ir"):
-        view = run(ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, 8)))
+        view = run(ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, 8), OPERATOR))
 
     assert view.status == ReservationStatus.PENDING
     row = stock_row(offer_id)
@@ -204,12 +209,12 @@ def test_over_limit_reserve_rolls_back_state_and_event_together(offer_id):
     counter change nor an orphan event."""
     seed_stock(offer_id, 10)
     with system_event_context(region="ir"):
-        run(ReserveStock(inv_uow).execute(reserve_cmd(uuid.uuid4(), offer_id, 8)))
+        run(ReserveStock(inv_uow).execute(reserve_cmd(uuid.uuid4(), offer_id, 8), OPERATOR))
     before = stock_row(offer_id)
 
     with system_event_context(region="ir"):
         with pytest.raises(ConflictError):
-            run(ReserveStock(inv_uow).execute(reserve_cmd(uuid.uuid4(), offer_id, 5)))
+            run(ReserveStock(inv_uow).execute(reserve_cmd(uuid.uuid4(), offer_id, 5), OPERATOR))
 
     assert stock_row(offer_id) == before
     assert db.scalar("select count(*) from inventory_reservation") == 1
@@ -235,8 +240,8 @@ def test_duplicate_reservation_id_applies_once(offer_id):
     rid = uuid.uuid4()
 
     with system_event_context(region="ir"):
-        first = run(ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, 4)))
-        second = run(ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, 4)))
+        first = run(ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, 4), OPERATOR))
+        second = run(ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, 4), OPERATOR))
 
     assert first.id == second.id
     assert stock_row(offer_id)["reserved"] == 4
@@ -249,7 +254,7 @@ def test_duplicate_reservation_id_is_rejected_by_the_primary_key(offer_id):
     seed_stock(offer_id, 10)
     rid = uuid.uuid4()
     with system_event_context(region="ir"):
-        run(ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, 1)))
+        run(ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, 1), OPERATOR))
 
     with pytest.raises(Exception) as exc:
         db.execute(
@@ -266,9 +271,9 @@ def test_release_returns_stock_and_emits_released(offer_id):
     seed_stock(offer_id, 10)
     rid = uuid.uuid4()
     with system_event_context(region="ir"):
-        run(ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, 6)))
-        view = run(ReleaseReservation(inv_uow).execute(rid))
-        run(ReleaseReservation(inv_uow).execute(rid))  # idempotent
+        run(ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, 6), OPERATOR))
+        view = run(ReleaseReservation(inv_uow).execute(rid, OPERATOR))
+        run(ReleaseReservation(inv_uow).execute(rid, OPERATOR))  # idempotent
 
     assert view.status == ReservationStatus.RELEASED
     assert stock_row(offer_id)["reserved"] == 0
@@ -279,10 +284,10 @@ def test_committed_reservation_cannot_be_released(offer_id):
     seed_stock(offer_id, 10)
     rid = uuid.uuid4()
     with system_event_context(region="ir"):
-        run(ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, 6)))
-        run(CommitReservation(inv_uow).execute(rid))
+        run(ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, 6), OPERATOR))
+        run(CommitReservation(inv_uow).execute(rid, OPERATOR))
         with pytest.raises(ConflictError):
-            run(ReleaseReservation(inv_uow).execute(rid))
+            run(ReleaseReservation(inv_uow).execute(rid, OPERATOR))
 
     row = stock_row(offer_id)
     assert (row["on_hand"], row["reserved"]) == (4, 0)
@@ -296,7 +301,7 @@ def test_expiry_returns_stock_and_emits_inventory_expired(offer_id):
     seed_stock(offer_id, 10)
     rid = uuid.uuid4()
     with system_event_context(region="ir"):
-        run(ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, 6)))
+        run(ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, 6), OPERATOR))
     db.execute(
         "update inventory_reservation set expires_at = now() - interval '1 minute' "
         "where id=:r", r=rid,
@@ -321,7 +326,7 @@ def test_expiry_claim_uses_skip_locked_so_sweepers_do_not_block(offer_id, second
     for oid in (offer_id, second_offer_id):
         rid = uuid.uuid4()
         with system_event_context(region="ir"):
-            run(ReserveStock(inv_uow).execute(reserve_cmd(rid, oid, 2)))
+            run(ReserveStock(inv_uow).execute(reserve_cmd(rid, oid, 2), OPERATOR))
     db.execute("update inventory_reservation set expires_at = now() - interval '1 minute'")
 
     async def sweep():
@@ -348,7 +353,7 @@ def test_two_concurrent_reservations_for_the_last_unit_serialise(offer_id):
     async def attempt(rid):
         with system_event_context(region="ir"):
             try:
-                await ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, 1))
+                await ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, 1), OPERATOR)
                 return "won"
             except ConflictError:
                 return "rejected"
@@ -395,7 +400,7 @@ def test_no_oversell_under_concurrent_load(offer_id, stock, attempts):
         with system_event_context(region="ir"):
             try:
                 await ReserveStock(inv_uow).execute(
-                    reserve_cmd(uuid.uuid4(), offer_id, 1)
+                    reserve_cmd(uuid.uuid4(), offer_id, 1), OPERATOR
                 )
                 return True
             except (ConflictError, ConcurrencyConflictError):
@@ -507,7 +512,7 @@ def test_commit_of_an_expired_reservation_replies_instead_of_dead_lettering(offe
     seed_stock(offer_id, 10)
     rid = uuid.uuid4()
     with system_event_context(region="ir"):
-        run(ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, 4)))
+        run(ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, 4), OPERATOR))
     db.execute(
         "update inventory_reservation set expires_at = now() - interval '1 minute' "
         "where id=:r", r=rid,
@@ -575,8 +580,8 @@ def test_inventory_writes_touch_no_other_contexts_tables(offer_id):
 
     rid = uuid.uuid4()
     with system_event_context(region="ir"):
-        run(ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, 4)))
-        run(CommitReservation(inv_uow).execute(rid))
+        run(ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, 4), OPERATOR))
+        run(CommitReservation(inv_uow).execute(rid, OPERATOR))
 
     after = {t: db.scalar(f"select count(*) from {t}") for t in snapshot}
     assert after == snapshot
@@ -589,8 +594,8 @@ def test_reconciliation_invariant_i8_holds_after_a_mixed_workload(offer_id):
     keep, release, expire = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     with system_event_context(region="ir"):
         for rid, qty in ((keep, 3), (release, 4), (expire, 5)):
-            run(ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, qty)))
-        run(ReleaseReservation(inv_uow).execute(release))
+            run(ReserveStock(inv_uow).execute(reserve_cmd(rid, offer_id, qty), OPERATOR))
+        run(ReleaseReservation(inv_uow).execute(release, OPERATOR))
     db.execute(
         "update inventory_reservation set expires_at = now() - interval '1 minute' "
         "where id=:r", r=expire,

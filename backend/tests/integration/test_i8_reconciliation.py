@@ -11,11 +11,24 @@ import uuid
 
 import pytest
 
+from src.shared_kernel.application.permissions import Permission
+from src.shared_kernel.application.security import Principal
 from tests.integration import db
 
 db.skip_if_unavailable()  # module-level: an unrun suite must never look green
 
 pytestmark = pytest.mark.integration
+
+
+OPERATOR = Principal(
+    subject_id=uuid.uuid4(),
+    platform_permissions=frozenset({
+        Permission.INVENTORY_MANAGE_ANY,
+        Permission.INVENTORY_RESERVATIONS_CREATE,
+        Permission.INVENTORY_RESERVATIONS_COMMIT,
+        Permission.INVENTORY_RESERVATIONS_RELEASE,
+    }),
+)
 
 
 def find_drift():
@@ -147,6 +160,6 @@ def test_a_real_reserve_leaves_no_drift(offer_id):
         db.run(ReserveStock(inv_uow).execute(ReserveStockCommand(
             reservation_id=str(uuid.uuid4()), offer_id=str(offer_id),
             location="default", quantity=4,
-        )))
+        ), OPERATOR))
 
     assert find_drift() == []

@@ -538,6 +538,70 @@ so it would have barred `catalog_admin` from its own endpoints. Caught by the
 "legitimate role still works" counterweight test, which is why every guard here
 has one.
 
+### 9.5 Platform authorization at the use-case boundary (Phase 1H)
+
+§9.4 put the check on the ROUTE. Phase 1H moved the authoritative decision into
+the USE CASE, where the business boundary is, and kept the router guard as a
+coarse floor. The two are not redundant:
+
+* a router guard protects a **route**. It protects nothing when the use case is
+  reached from a consumer, a CLI, a test, or a future non-HTTP surface;
+* a router guard cannot see the request **body**, so it cannot tell an attribute
+  edit from a publish.
+
+`shared_kernel/application/platform_policy.py::ensure_can_platform(principal,
+*permissions)` is the single implementation. It is variadic and requires **all**
+listed permissions, never any: a compound request must not slip through on the
+weaker of its two authorities. It reads `Principal.can` only, so a seller
+membership can never satisfy it.
+
+**Update, publish and archive are three authorities, not one.**
+`PATCH /catalog/admin/products/{id}` accepts `status`, which puts a product on or
+off the storefront. Demanding `catalog.products.update` for that made `.publish`
+and `.archive` decorative. The permission is now derived from the COMMAND:
+
+| Request contains | Requires |
+|---|---|
+| any attribute field | `catalog.products.update` |
+| `status: "active"` | `catalog.products.publish` |
+| `status: "archived"` | `catalog.products.archive` |
+| `status: "draft"` | `catalog.products.publish` |
+| attributes **and** status | both |
+
+`update` is demanded only when a non-status field is actually present —
+otherwise a publish-only role could not publish, which would collapse the
+distinction. `catalog_admin` holds all three today, so no observable behaviour
+changes; the matrix is a contract for the roles that do not exist yet.
+
+> **INTERPRETIVE DECISION, flagged for review.** `status: "draft"` maps to
+> `publish`. The permission descriptions name publishing and archiving but not
+> *withdrawal*, so the baseline does not settle it. Moving a product out of
+> ACTIVE is an unpublish — the same storefront-visibility authority exercised in
+> the other direction — and requiring more authority rather than less is the
+> safe reading. This is the one place Phase 1H chose rather than derived.
+
+**Ordering.** For platform-scoped operations the required permission depends only
+on the command, never on the stored resource, so the check runs **before the
+load**. That closes the write-before-authorize hole and the existence oracle in
+the same move: an unauthorized caller cannot distinguish a real product id from a
+fabricated one, nor a taken slug from a free one. `ReceiveStock` is the deliberate
+exception — its permission is seller-scoped, so it must resolve the offer's owner
+first (§9.4).
+
+**One trust context per use case.** `ReleaseReservation` served two: an operator
+over HTTP, and the saga's compensation path. Attaching a mandatory Principal
+would have broken compensation, and authorizing on the `reason` string would have
+been authorization by a caller-supplied value. The saga path moved to
+`ReleaseForOrder`, mirroring the split the module already made for reserve
+(`ReserveForOrder`) and commit (`CommitForOrder`), and both share one release
+implementation so they cannot drift.
+
+**Saga participants take no Principal, deliberately.** They react to events only
+the outbox delivers; there is no caller whose authority could be checked.
+Inventing a "system principal" to satisfy a signature would create a bypass
+primitive — anything able to construct one would hold every permission. The
+authorization boundary for those paths is the event itself.
+
 ---
 
 ## 10. Membership resolution — Redis cache with outbox invalidation

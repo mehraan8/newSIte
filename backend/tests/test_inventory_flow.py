@@ -217,7 +217,16 @@ SELLER = uuid.uuid4()
 # than a bypass.
 OPERATOR = Principal(
     subject_id=uuid.uuid4(),
-    platform_permissions=frozenset({Permission.INVENTORY_MANAGE_ANY}),
+    platform_permissions=frozenset({
+        # Listed individually, NOT as one blanket grant. `inventory.manage.any`
+        # does not imply reservation authority — dropping any line below turns
+        # the corresponding tests into ForbiddenError, which is how this fixture
+        # demonstrates that the permissions really are independent.
+        Permission.INVENTORY_MANAGE_ANY,
+        Permission.INVENTORY_RESERVATIONS_CREATE,
+        Permission.INVENTORY_RESERVATIONS_COMMIT,
+        Permission.INVENTORY_RESERVATIONS_RELEASE,
+    }),
 )
 
 
@@ -254,7 +263,7 @@ def test_receive_then_reserve_holds_stock_and_emits_reserved():
     store, ucs = stocked(10)
     rid = uuid.uuid4()
 
-    view = run(ucs["reserve"].execute(reserve_cmd(rid, 8)))
+    view = run(ucs["reserve"].execute(reserve_cmd(rid, 8), OPERATOR))
 
     assert view.status == ReservationStatus.PENDING
     assert store.reserved() == 8
@@ -266,17 +275,17 @@ def test_reserve_against_unknown_offer_is_not_found():
     store = Store()
     ucs = build(store)
     with pytest.raises(NotFoundError):
-        run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 1)))
+        run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 1), OPERATOR))
     assert store.reservations == {} and store.outbox == []
 
 
 # === requirement: reserve over limit fails ================================
 def test_reserve_beyond_available_is_rejected_and_changes_nothing():
     store, ucs = stocked(10)
-    run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 8)))
+    run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 8), OPERATOR))
 
     with pytest.raises(ConflictError):
-        run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 5)))   # only 2 free
+        run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 5), OPERATOR))   # only 2 free
 
     assert store.reserved() == 8
     assert store.events("InventoryReserved") == 1
@@ -285,11 +294,11 @@ def test_reserve_beyond_available_is_rejected_and_changes_nothing():
 
 def test_reserve_exactly_available_succeeds_and_next_unit_fails():
     store, ucs = stocked(3)
-    run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 3)))
+    run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 3), OPERATOR))
     assert store.reserved() == 3
 
     with pytest.raises(ConflictError):
-        run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 1)))
+        run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 1), OPERATOR))
     assert store.reserved() == 3
 
 
@@ -298,7 +307,7 @@ def test_reserved_never_exceeds_on_hand_across_many_holds():
     granted = 0
     for _ in range(10):
         try:
-            run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 1)))
+            run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 1), OPERATOR))
             granted += 1
         except ConflictError:
             pass
@@ -312,8 +321,8 @@ def test_duplicate_reservation_id_is_a_no_op():
     store, ucs = stocked(10)
     rid = uuid.uuid4()
 
-    first = run(ucs["reserve"].execute(reserve_cmd(rid, 8)))
-    second = run(ucs["reserve"].execute(reserve_cmd(rid, 8)))
+    first = run(ucs["reserve"].execute(reserve_cmd(rid, 8), OPERATOR))
+    second = run(ucs["reserve"].execute(reserve_cmd(rid, 8), OPERATOR))
 
     assert first.id == second.id == str(rid)
     assert store.reserved() == 8                      # counted once
@@ -324,9 +333,9 @@ def test_duplicate_reservation_with_a_different_quantity_does_not_re_reserve():
     """The id is the idempotency key; a conflicting body must not double-hold."""
     store, ucs = stocked(10)
     rid = uuid.uuid4()
-    run(ucs["reserve"].execute(reserve_cmd(rid, 4)))
+    run(ucs["reserve"].execute(reserve_cmd(rid, 4), OPERATOR))
 
-    again = run(ucs["reserve"].execute(reserve_cmd(rid, 9)))
+    again = run(ucs["reserve"].execute(reserve_cmd(rid, 9), OPERATOR))
 
     assert again.quantity == 4
     assert store.reserved() == 4
@@ -335,17 +344,17 @@ def test_duplicate_reservation_with_a_different_quantity_does_not_re_reserve():
 def test_commit_and_release_are_idempotent():
     store, ucs = stocked(10)
     rid, rid2 = uuid.uuid4(), uuid.uuid4()
-    run(ucs["reserve"].execute(reserve_cmd(rid, 8)))
+    run(ucs["reserve"].execute(reserve_cmd(rid, 8), OPERATOR))
 
-    run(ucs["commit"].execute(rid))
-    run(ucs["commit"].execute(rid))
+    run(ucs["commit"].execute(rid, OPERATOR))
+    run(ucs["commit"].execute(rid, OPERATOR))
     rec = store.items[(OFFER, LOC)]
     assert (rec["on_hand"], rec["reserved"]) == (2, 0)
     assert store.events("InventoryCommitted") == 1
 
-    run(ucs["reserve"].execute(reserve_cmd(rid2, 2)))
-    run(ucs["release"].execute(rid2))
-    run(ucs["release"].execute(rid2))
+    run(ucs["reserve"].execute(reserve_cmd(rid2, 2), OPERATOR))
+    run(ucs["release"].execute(rid2, OPERATOR))
+    run(ucs["release"].execute(rid2, OPERATOR))
     assert store.reserved() == 0
     assert store.events("InventoryReleased") == 1
 
@@ -353,11 +362,11 @@ def test_commit_and_release_are_idempotent():
 def test_committed_reservation_cannot_be_released():
     store, ucs = stocked(10)
     rid = uuid.uuid4()
-    run(ucs["reserve"].execute(reserve_cmd(rid, 8)))
-    run(ucs["commit"].execute(rid))
+    run(ucs["reserve"].execute(reserve_cmd(rid, 8), OPERATOR))
+    run(ucs["commit"].execute(rid, OPERATOR))
 
     with pytest.raises(ConflictError):
-        run(ucs["release"].execute(rid))
+        run(ucs["release"].execute(rid, OPERATOR))
     assert store.events("InventoryReleased") == 0
 
 
@@ -381,7 +390,7 @@ def test_transient_conflict_is_retried_and_reserves_exactly_once():
     store, ucs = stocked(10)
     store.force_save_conflicts = 1                   # first save loses the race
 
-    view = run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 3)))
+    view = run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 3), OPERATOR))
 
     assert view.status == ReservationStatus.PENDING
     assert store.force_save_conflicts == 0
@@ -394,7 +403,7 @@ def test_persistent_conflict_surfaces_after_the_retry_budget():
     store.force_save_conflicts = 99                  # always loses
 
     with pytest.raises(ConcurrencyConflictError):
-        run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 3)))
+        run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 3), OPERATOR))
 
     assert store.reserved() == 0
     assert store.reservations == {} and store.outbox == []
@@ -404,8 +413,8 @@ def test_reservation_status_write_is_compare_and_set():
     """save_reservation must reject a transition from an unexpected status."""
     store, ucs = stocked(10)
     rid = uuid.uuid4()
-    run(ucs["reserve"].execute(reserve_cmd(rid, 2)))
-    run(ucs["commit"].execute(rid))                  # now COMMITTED
+    run(ucs["reserve"].execute(reserve_cmd(rid, 2), OPERATOR))
+    run(ucs["commit"].execute(rid, OPERATOR))                  # now COMMITTED
 
     uow = FakeInvUoW(store)
     res = run(uow.inventory.get_reservation(rid))
@@ -417,11 +426,11 @@ def test_concurrent_commit_and_release_cannot_both_win():
     """Both readers see PENDING; the version guard on the item serialises them."""
     store, ucs = stocked(10)
     rid = uuid.uuid4()
-    run(ucs["reserve"].execute(reserve_cmd(rid, 4)))
+    run(ucs["reserve"].execute(reserve_cmd(rid, 4), OPERATOR))
 
-    run(ucs["commit"].execute(rid))                  # winner
+    run(ucs["commit"].execute(rid, OPERATOR))                  # winner
     with pytest.raises(ConflictError):               # loser re-reads: COMMITTED
-        run(ucs["release"].execute(rid))
+        run(ucs["release"].execute(rid, OPERATOR))
 
     rec = store.items[(OFFER, LOC)]
     assert (rec["on_hand"], rec["reserved"]) == (6, 0)
@@ -444,7 +453,7 @@ def test_failed_reservation_leaves_no_state_and_no_events():
     FakeRepo.add_reservation = explode
     try:
         with pytest.raises(RuntimeError):
-            run(ucs["reserve"].execute(reserve_cmd(rid, 8)))
+            run(ucs["reserve"].execute(reserve_cmd(rid, 8), OPERATOR))
     finally:
         FakeRepo.add_reservation = original
 
@@ -467,7 +476,7 @@ def test_rollback_does_not_leak_events_into_a_later_commit():
     assert store.outbox == []
     assert store.reserved() == 0
 
-    run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 1)))
+    run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 1), OPERATOR))
     assert store.events("InventoryReserved") == 1     # not 2
 
 
@@ -490,7 +499,7 @@ def test_uncommitted_unit_of_work_stages_nothing():
 # === expiry (ADR-0009 D1) =================================================
 def expired_reservation(store, ucs, qty=4, offer=OFFER):
     rid = uuid.uuid4()
-    run(ucs["reserve"].execute(reserve_cmd(rid, qty, offer=offer, ttl=900)))
+    run(ucs["reserve"].execute(reserve_cmd(rid, qty, offer=offer, ttl=900), OPERATOR))
     store.reservations[rid]["expires_at"] = utcnow() - timedelta(seconds=1)
     return rid
 
@@ -515,7 +524,7 @@ def test_expiry_returns_stock_to_available():
     expired_reservation(store, ucs, qty=10)
     run(ucs["expire"].execute())
 
-    run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 10)))   # must fit again
+    run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 10), OPERATOR))   # must fit again
     assert store.reserved() == 10
 
 
@@ -530,7 +539,7 @@ def test_sweeper_is_idempotent_and_skips_non_pending():
 
 def test_unexpired_reservations_are_left_alone():
     store, ucs = stocked(10)
-    run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 4, ttl=900)))
+    run(ucs["reserve"].execute(reserve_cmd(uuid.uuid4(), 4, ttl=900), OPERATOR))
 
     assert run(ucs["expire"].execute()) == 0
     assert store.reserved() == 4
@@ -575,7 +584,7 @@ def test_committing_an_expired_reservation_replies_instead_of_raising():
 def test_commit_for_order_still_commits_a_pending_reservation():
     store, ucs = stocked(10)
     rid = uuid.uuid4()
-    run(ucs["reserve"].execute(reserve_cmd(rid, 4)))
+    run(ucs["reserve"].execute(reserve_cmd(rid, 4), OPERATOR))
 
     run(ucs["commit_saga"].execute(rid))
 
@@ -587,7 +596,7 @@ def test_commit_for_order_still_commits_a_pending_reservation():
 def test_commit_for_order_is_idempotent_under_redelivery():
     store, ucs = stocked(10)
     rid = uuid.uuid4()
-    run(ucs["reserve"].execute(reserve_cmd(rid, 4)))
+    run(ucs["reserve"].execute(reserve_cmd(rid, 4), OPERATOR))
 
     run(ucs["commit_saga"].execute(rid))
     run(ucs["commit_saga"].execute(rid))
@@ -689,7 +698,7 @@ def test_commit_for_order_replies_when_counters_cannot_absorb_the_commit():
     Raising here dead-letters a PAID order; the saga must get a fact instead."""
     store, ucs = stocked(10)
     rid = uuid.uuid4()
-    run(ucs["reserve"].execute(reserve_cmd(rid, 4)))
+    run(ucs["reserve"].execute(reserve_cmd(rid, 4), OPERATOR))
     store.items[(OFFER, LOC)]["reserved"] = 1        # drift under the reservation
 
     run(ucs["commit_saga"].execute(rid))             # must not raise
@@ -758,21 +767,21 @@ def test_aggregate_rejects_expiring_more_than_reserved():
 def test_commit_with_a_missing_stock_row_is_a_conflict_not_a_crash():
     store, ucs = stocked(10)
     rid = uuid.uuid4()
-    run(ucs["reserve"].execute(reserve_cmd(rid, 2)))
+    run(ucs["reserve"].execute(reserve_cmd(rid, 2), OPERATOR))
     del store.items[(OFFER, LOC)]                 # row vanished under the reservation
 
     with pytest.raises(ConflictError):
-        run(ucs["commit"].execute(rid))
+        run(ucs["commit"].execute(rid, OPERATOR))
 
 
 def test_release_with_a_missing_stock_row_is_a_conflict_not_a_crash():
     store, ucs = stocked(10)
     rid = uuid.uuid4()
-    run(ucs["reserve"].execute(reserve_cmd(rid, 2)))
+    run(ucs["reserve"].execute(reserve_cmd(rid, 2), OPERATOR))
     del store.items[(OFFER, LOC)]
 
     with pytest.raises(ConflictError):
-        run(ucs["release"].execute(rid))
+        run(ucs["release"].execute(rid, OPERATOR))
 
 
 def test_commit_for_order_replies_when_the_stock_row_is_missing():
@@ -780,7 +789,7 @@ def test_commit_for_order_replies_when_the_stock_row_is_missing():
     to be a persisted row so the outbox aggregate_id resolves."""
     store, ucs = stocked(10)
     rid = uuid.uuid4()
-    run(ucs["reserve"].execute(reserve_cmd(rid, 2)))
+    run(ucs["reserve"].execute(reserve_cmd(rid, 2), OPERATOR))
     del store.items[(OFFER, LOC)]
 
     run(ucs["commit_saga"].execute(rid))          # must not raise
@@ -818,7 +827,7 @@ def test_commit_consumer_still_commits_pending_reservations():
 
     store, ucs = stocked(10)
     rid = uuid.uuid4()
-    run(ucs["reserve"].execute(reserve_cmd(rid, 3)))
+    run(ucs["reserve"].execute(reserve_cmd(rid, 3), OPERATOR))
 
     consumer = OnInventoryCommitRequested(uow_factory=lambda: FakeInvUoW(store))
     run(consumer.handle(None, _Event({"reservation_ids": [str(rid)]})))

@@ -102,6 +102,23 @@ def clean(schema):
                 )
 
     db.run(_truncate())
+
+    # Disposable RBAC roles created by permission-level tests. `roles` and
+    # `role_permissions` are NOT in API_TABLES — they hold the seeded platform
+    # baseline, which must survive between tests — so anything a test adds there
+    # has to be removed by name. Leaving them behind is not cosmetic:
+    # tests/integration/test_rbac_seed.py asserts there are no non-system roles
+    # and that the role count equals the PlatformRole enum, so a leaked
+    # `qa_temp_*` row fails an unrelated suite depending on execution order.
+    db.execute(
+        "delete from role_permissions where role_id in "
+        "(select id from roles where code like 'qa_temp_%')"
+    )
+    db.execute(
+        "delete from user_roles where role_id in "
+        "(select id from roles where code like 'qa_temp_%')"
+    )
+    db.execute("delete from roles where code like 'qa_temp_%'")
     yield
 
 

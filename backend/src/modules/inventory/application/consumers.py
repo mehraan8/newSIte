@@ -73,9 +73,12 @@ class OnInventoryReleaseRequested:
         self._uf = uow_factory or _uow_factory()
 
     async def handle(self, session: Any, event: Any) -> None:
-        from src.modules.inventory.application.use_cases import ReleaseReservation
+        # ReleaseForOrder, not ReleaseReservation: the operator-facing class now
+        # requires a Principal, and a saga has no caller to authorize. Same
+        # split as reserve and commit above.
+        from src.modules.inventory.application.use_cases import ReleaseForOrder
 
-        uc = ReleaseReservation(self._uf)
+        uc = ReleaseForOrder(self._uf)
         reason = event.payload.get("reason", "compensation")
         for rid in event.payload.get("reservation_ids", ()):
             await uc.execute(uuid.UUID(rid), reason=reason)

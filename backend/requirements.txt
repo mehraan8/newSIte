@@ -6,7 +6,10 @@ pydantic-settings>=2.3
 python-dotenv>=1.0   # explicit: src/config/env_bootstrap.py imports it directly
 
 # --- Persistence ---
-SQLAlchemy>=2.0
+# [asyncio] pulls in greenlet, which the async engine cannot run without.
+# SQLAlchemy 2.1 stopped installing it by default, so a fresh install of
+# plain `SQLAlchemy` crashes on the first database call.
+SQLAlchemy[asyncio]>=2.0
 asyncpg>=0.29          # async driver used by the app
 psycopg[binary]>=3.1   # sync driver used by Alembic
 alembic>=1.13

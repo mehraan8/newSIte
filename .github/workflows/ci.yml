@@ -14,9 +14,18 @@
 name: CI
 
 on:
+  # Every branch, not only main: a feature branch must prove itself BEFORE it is
+  # merged, and a push without a PR used to run nothing at all.
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer push to the same ref supersedes the older run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   verify:
@@ -63,6 +72,10 @@ jobs:
       JWT_SECRET: ci-only-not-a-real-secret-0123456789abcdef
       OTP_PEPPER: ci-only-not-a-real-pepper-0123456789abcdef
       ENVIRONMENT: test
+      # Turns "Postgres unreachable" from a SKIP (exit 0, looks green) into a
+      # FAILURE. Without it, a broken service container would let this job pass
+      # having run none of the database or HTTP authorization suites.
+      REQUIRE_LIVE_DB: "1"
 
     steps:
       - uses: actions/checkout@v4
@@ -83,5 +96,14 @@ jobs:
       - name: Type check
         run: python -m mypy
 
+      # Applies every migration to the empty service database. The test suite
+      # builds its own scratch schema, so without this step a migration that
+      # fails on real Postgres would never be noticed until deploy.
+      - name: Migrations apply to an empty database
+        run: |
+          python -m alembic upgrade head
+          python -m alembic current
+
+      # -rs prints the reason for any skip, so one that slips through is visible.
       - name: Test
-        run: python -m pytest
+        run: python -m pytest -rs

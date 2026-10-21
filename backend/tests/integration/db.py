@@ -174,9 +174,20 @@ def availability() -> tuple[bool, str, str]:
 
 def skip_if_unavailable() -> None:
     """Module-level guard. Skips — never silently passes — so an unrun suite can
-    never be mistaken for a green one."""
+    never be mistaken for a green one.
+
+    With REQUIRE_LIVE_DB=1 (set in CI) it FAILS instead. A skip still exits 0,
+    so a CI whose Postgres service broke would report green having run none of
+    the database or HTTP authorization suites.
+    """
     ok, reason, dsn = availability()
     if not ok:
+        if os.environ.get("REQUIRE_LIVE_DB") == "1":
+            pytest.fail(
+                f"REQUIRE_LIVE_DB=1 but live Postgres is unavailable ({reason}). "
+                f"The database suites cannot run, so this run must not pass.",
+                pytrace=False,
+            )
         pytest.skip(
             f"LIVE POSTGRES REQUIRED AND UNAVAILABLE ({reason}). "
             f"These validations were NOT executed. Start Postgres and set "

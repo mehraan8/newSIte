@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from src.modules.identity.domain.entities import User
+from src.shared_kernel.application.errors import AppError
 from src.shared_kernel.domain.value_objects import Mobile
 
 
@@ -39,8 +40,29 @@ class OtpStore(Protocol):
     async def mark_sent(self, mobile: Mobile, cooldown: int) -> None: ...
 
 
+class OtpDeliveryError(AppError):
+    """The provider did not accept the message. Part of the `OtpSender` contract.
+
+    503: the caller did nothing wrong and may retry later. The message is fixed
+    and generic on purpose — whatever the provider said (and whatever URL the
+    adapter called, which for Kavenegar contains the API key) stays out of the
+    response. `reason` is a short, secret-free label for logs and tests.
+    """
+
+    code = "otp_delivery_failed"
+    http_status = 503
+    message_fa = "ارسال کد تأیید ممکن نشد. لطفاً کمی بعد دوباره تلاش کنید."
+
+    def __init__(self, reason: str) -> None:
+        super().__init__()
+        self.reason = reason
+
+
 class OtpSender(Protocol):
-    async def send_code(self, mobile: Mobile, code: str) -> None: ...
+    async def send_code(self, mobile: Mobile, code: str) -> None:
+        """Deliver `code` to `mobile`. Raises OtpDeliveryError if the provider
+        did not accept it; never includes the code in the error."""
+        ...
 
 
 @dataclass(frozen=True)

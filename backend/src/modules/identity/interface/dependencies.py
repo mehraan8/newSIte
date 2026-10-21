@@ -25,24 +25,15 @@ from src.modules.identity.infrastructure.repository import (
 )
 from src.modules.identity.infrastructure.role_repository import SqlPlatformRoleQuery
 from src.modules.identity.infrastructure.unit_of_work import SqlAlchemyIdentityUnitOfWork
-from src.modules.identity.infrastructure.sms_sender import (
-    ConsoleOtpSender,
-    KavenegarOtpSender,
-)
+from src.modules.identity.infrastructure.sms_sender import build_otp_sender
 from src.config.settings import settings
 from src.shared_kernel.application.errors import UnauthorizedError
 from src.shared_kernel.infrastructure.database import get_session
 from src.shared_kernel.infrastructure.redis_client import get_redis
 
 
-def _sender():
-    if settings.sms_provider == "kavenegar":
-        return KavenegarOtpSender(api_key="", template="otp")  # configure via settings
-    return ConsoleOtpSender()
-
-
 def get_request_otp() -> RequestOtp:
-    return RequestOtp(otp_store=RedisOtpStore(get_redis()), sender=_sender())
+    return RequestOtp(otp_store=RedisOtpStore(get_redis()), sender=build_otp_sender(settings))
 
 
 def get_verify_otp() -> VerifyOtp:

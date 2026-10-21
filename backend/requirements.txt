@@ -16,3 +16,6 @@ redis>=5.0
 
 # --- Auth ---
 PyJWT>=2.8
+
+# --- Outbound HTTP (SMS provider adapter; also used by tests/api) ---
+httpx>=0.27

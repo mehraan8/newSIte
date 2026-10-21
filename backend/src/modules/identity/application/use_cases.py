@@ -21,6 +21,7 @@ from src.modules.identity.application.dtos import (
     OtpRequested,
 )
 from src.modules.identity.application.ports import (
+    OtpDeliveryError,
     OtpSender,
     OtpStore,
     PlatformRoleQuery,
@@ -67,7 +68,14 @@ class RequestOtp:
         code = _generate_code(settings.otp_length)
         await self._store.save(mobile, _hash_code(code), settings.otp_ttl_seconds)
         await self._store.mark_sent(mobile, settings.otp_resend_cooldown_seconds)
-        await self._sender.send_code(mobile, code)
+        try:
+            await self._sender.send_code(mobile, code)
+        except OtpDeliveryError:
+            # The user never received this code, so it must not stay verifiable.
+            # The cooldown is left in place deliberately: it is what stops a
+            # caller from hammering a failing provider, one request per second.
+            await self._store.delete(mobile)
+            raise
 
         return OtpRequested(
             masked_mobile=mobile.masked,

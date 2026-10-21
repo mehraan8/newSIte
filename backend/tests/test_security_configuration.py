@@ -26,6 +26,10 @@ def production(**overrides) -> Settings:
     base = dict(
         environment="production", debug=False,
         jwt_secret=SAFE_SECRET, otp_pepper=SAFE_PEPPER,
+        # Production refuses the console provider, so a well-formed production
+        # config names a real one. Placeholder credentials: nothing is sent.
+        sms_provider="kavenegar", kavenegar_api_key="test-key",
+        kavenegar_otp_template="otp",
     )
     return Settings(**{**base, **overrides})
 

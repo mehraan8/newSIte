@@ -5,7 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import ClassVar
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.config.env_bootstrap import load_env
@@ -19,7 +19,9 @@ load_env()
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(extra="ignore")
+    # hide_input_in_errors: a refused boot otherwise echoes the raw input values,
+    # secrets included (JWT_SECRET, KAVENEGAR_API_KEY), into the deployment log.
+    model_config = SettingsConfigDict(extra="ignore", hide_input_in_errors=True)
 
     # --- App ---
     app_name: str = "Persian RTL E-Commerce API"
@@ -61,7 +63,19 @@ class Settings(BaseSettings):
     # Same contract as jwt_secret: a published default, refused outside
     # development. A known pepper makes the stored OTP hashes precomputable.
     otp_pepper: str = "change-me-otp-pepper"  # noqa: S105 - dev default only
-    sms_provider: str = "console"  # console | kavenegar | smsir
+
+    # --- OTP delivery provider ---
+    # console   -> development/test only; delivers nothing (see ConsoleOtpSender)
+    # kavenegar -> Kavenegar Verify Lookup; needs the two KAVENEGAR_* below
+    # Any other value refuses to boot. It used to fall back to console silently,
+    # which in production meant no code was ever delivered and nothing said so.
+    sms_provider: str = "console"
+    # SecretStr so the key never appears in a repr, a traceback or a settings dump.
+    kavenegar_api_key: SecretStr = SecretStr("")
+    # Template name as created in the Kavenegar panel; it holds the message text.
+    kavenegar_otp_template: str = ""
+    kavenegar_base_url: str = "https://api.kavenegar.com"
+    sms_timeout_seconds: float = 5.0
 
     # --- Selling / Marketplace ---
     # Configurable invariant: at most one ACTIVE offer per seller per variant.
@@ -97,10 +111,45 @@ class Settings(BaseSettings):
     }
     #: Environments where the published development defaults are acceptable.
     DEV_ENVIRONMENTS: ClassVar[frozenset[str]] = frozenset({"development", "test", "local"})
+    #: OTP delivery providers with a working adapter.
+    SMS_PROVIDERS: ClassVar[frozenset[str]] = frozenset({"console", "kavenegar"})
 
     @property
     def is_development(self) -> bool:
         return self.environment.strip().lower() in self.DEV_ENVIRONMENTS
+
+    @model_validator(mode="after")
+    def _validate_sms_provider(self) -> "Settings":
+        """Provider misconfiguration fails at boot, in EVERY environment.
+
+        An unknown name or a Kavenegar setup without credentials is never what
+        anyone meant, so there is no environment in which booting anyway helps.
+        Whether `console` is acceptable depends on the environment and is
+        checked with the other production rules in `_reject_insecure_defaults`.
+        """
+        provider = self.sms_provider.strip().lower()
+        if provider not in self.SMS_PROVIDERS:
+            raise ValueError(
+                f"SMS_PROVIDER={self.sms_provider!r} is not supported; "
+                f"use one of {sorted(self.SMS_PROVIDERS)}"
+            )
+        self.sms_provider = provider
+        if provider == "kavenegar":
+            missing = [
+                name
+                for name, value in (
+                    ("KAVENEGAR_API_KEY", self.kavenegar_api_key.get_secret_value()),
+                    ("KAVENEGAR_OTP_TEMPLATE", self.kavenegar_otp_template),
+                )
+                if not value.strip()
+            ]
+            if missing:
+                raise ValueError(
+                    "SMS_PROVIDER=kavenegar requires " + " and ".join(missing)
+                )
+        if self.sms_timeout_seconds <= 0:
+            raise ValueError("SMS_TIMEOUT_SECONDS must be positive")
+        return self
 
     @model_validator(mode="after")
     def _reject_insecure_defaults(self) -> "Settings":
@@ -129,6 +178,10 @@ class Settings(BaseSettings):
             problems.append("OTP_PEPPER is shorter than 16 characters")
         if self.otp_log_codes:
             problems.append("OTP_LOG_CODES is enabled, which writes OTP codes to the log")
+        if self.sms_provider == "console":
+            problems.append(
+                "SMS_PROVIDER is 'console', which delivers no OTP; configure a real provider"
+            )
         if self.debug:
             problems.append("DEBUG is enabled")
 

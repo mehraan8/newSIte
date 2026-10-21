@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.modules.identity.domain.entities import User
 from src.modules.identity.infrastructure.models import RefreshTokenModel, UserModel
+from src.shared_kernel.application.unit_of_work import Tracker
 from src.shared_kernel.domain.base import utcnow
 from src.shared_kernel.domain.value_objects import Mobile
 
@@ -26,16 +27,30 @@ def _to_domain(row: UserModel) -> User:
 
 
 class SqlUserRepository:
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, tracker: Tracker | None = None) -> None:
         self._s = session
+        self._tracker = tracker
+
+    def _track(self, user: User) -> None:
+        # Register the aggregate so the UoW can drain its events on commit.
+        if self._tracker is not None:
+            self._tracker.track(user)
 
     async def get_by_mobile(self, mobile: Mobile) -> User | None:
         row = await self._s.scalar(select(UserModel).where(UserModel.mobile == str(mobile)))
-        return _to_domain(row) if row else None
+        if row is None:
+            return None
+        user = _to_domain(row)
+        self._track(user)
+        return user
 
     async def get_by_id(self, user_id: uuid.UUID) -> User | None:
         row = await self._s.get(UserModel, user_id)
-        return _to_domain(row) if row else None
+        if row is None:
+            return None
+        user = _to_domain(row)
+        self._track(user)
+        return user
 
     async def add(self, user: User) -> None:
         self._s.add(
@@ -48,6 +63,7 @@ class SqlUserRepository:
                 is_phone_verified=user.is_phone_verified,
             )
         )
+        self._track(user)
         await self._s.flush()
 
     async def update(self, user: User) -> None:
@@ -61,6 +77,24 @@ class SqlUserRepository:
                 is_phone_verified=user.is_phone_verified,
                 last_login_at=utcnow(),
             )
+        )
+
+
+class SqlUserStatusQuery:
+    """One indexed column, on the authentication hot path.
+
+    `ix_users_status` is irrelevant here — this is a primary-key lookup, which is
+    what makes a per-request account-status check affordable. ADR-0011 §8 accepts
+    stale ROLES for the life of an access token; it does not accept a stale
+    ACCOUNT, because a blocked account must stop working at once (§16.1).
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._s = session
+
+    async def status_of(self, user_id: uuid.UUID) -> str | None:
+        return await self._s.scalar(
+            select(UserModel.status).where(UserModel.id == user_id)
         )
 
 
@@ -94,22 +128,53 @@ class SqlRefreshTokenStore:
             return None
         return {"user_id": str(row.user_id), "family_id": str(row.family_id)}
 
-    async def rotate(self, old_hash: str, new_hash: str, ttl: int) -> None:
-        row = await self._s.scalar(
-            select(RefreshTokenModel).where(RefreshTokenModel.token_hash == old_hash)
-        )
-        if row is None:
-            return
-        row.revoked_at = utcnow()
+    async def rotate(self, old_hash: str, new_hash: str, ttl: int) -> bool:
+        """Atomically consume `old_hash` and issue `new_hash`. False if it was
+        already consumed.
+
+        This was a read-then-write: SELECT the row, set `revoked_at`, INSERT the
+        child. Two requests presenting the SAME token concurrently both passed
+        the read before either wrote, and both got a token — a single-use
+        credential spent N times, producing N live siblings. Verified: ten
+        parallel refreshes of one token returned ten valid tokens.
+
+        That is worse than it looks. Reuse detection (D1) fires when a token that
+        is no longer in the table is presented again. Under the race the thief
+        and the victim each walk away with a DIFFERENT valid token, so neither
+        ever replays a consumed one, and the theft is never detected. The race
+        did not merely duplicate a token; it disabled the alarm.
+
+        The fix is one conditional UPDATE. `revoked_at IS NULL` makes the claim
+        the same operation as the check, and Postgres serialises the two writers
+        on the row: the loser re-evaluates the predicate after the winner commits
+        and matches zero rows. RETURNING carries the family across so the caller
+        does not need a second read.
+        """
+        claimed = (
+            await self._s.execute(
+                update(RefreshTokenModel)
+                .where(
+                    RefreshTokenModel.token_hash == old_hash,
+                    RefreshTokenModel.revoked_at.is_(None),
+                )
+                .values(revoked_at=utcnow())
+                .returning(RefreshTokenModel.user_id, RefreshTokenModel.family_id)
+            )
+        ).first()
+        if claimed is None:
+            return False
+
+        user_id, family_id = claimed
         self._s.add(
             RefreshTokenModel(
-                user_id=row.user_id,
+                user_id=user_id,
                 token_hash=new_hash,
-                family_id=row.family_id,
+                family_id=family_id,
                 expires_at=utcnow() + timedelta(seconds=ttl),
             )
         )
         await self._s.flush()
+        return True
 
     async def revoke_family(self, family_id: uuid.UUID) -> None:
         await self._s.execute(
@@ -117,3 +182,11 @@ class SqlRefreshTokenStore:
             .where(RefreshTokenModel.family_id == family_id, RefreshTokenModel.revoked_at.is_(None))
             .values(revoked_at=utcnow())
         )
+        # Commit HERE, not at the end of the request. Reuse detection revokes the
+        # family and then raises UnauthorizedError; the request-scoped session
+        # (see shared_kernel/infrastructure/database.py:get_session) rolls back on
+        # any exception, which silently discarded this revocation and left the
+        # stolen family fully usable. This is the only write in that code path, so
+        # committing it here makes the security guarantee real without affecting
+        # anything else staged on the session.
+        await self._s.commit()

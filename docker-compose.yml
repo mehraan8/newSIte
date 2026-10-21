@@ -31,6 +31,8 @@ x-app-env: &app-env
   JWT_SECRET: ${JWT_SECRET}
   OTP_PEPPER: ${OTP_PEPPER}
   SMS_PROVIDER: ${SMS_PROVIDER:-console}
+  KAVENEGAR_API_KEY: ${KAVENEGAR_API_KEY:-}
+  KAVENEGAR_OTP_TEMPLATE: ${KAVENEGAR_OTP_TEMPLATE:-}
   DEFAULT_LOCALE: ${DEFAULT_LOCALE:-fa-IR}
   CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:3000"]}
 
@@ -135,6 +137,14 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      # Bringing up the API explicitly (`up -d api` / `up -d api-dev`) must also
+      # bring up the workers: without the relay no event is ever delivered and
+      # checkout cannot complete, and without the sweeper expired holds are never
+      # returned. service_started (not _healthy) because workers serve no HTTP.
+      relay:
+        condition: service_started
+      inventory-expiry:
+        condition: service_started
     networks: [backend]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=4).status==200 else 1)"]
@@ -175,6 +185,14 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      # Bringing up the API explicitly (`up -d api` / `up -d api-dev`) must also
+      # bring up the workers: without the relay no event is ever delivered and
+      # checkout cannot complete, and without the sweeper expired holds are never
+      # returned. service_started (not _healthy) because workers serve no HTTP.
+      relay:
+        condition: service_started
+      inventory-expiry:
+        condition: service_started
     networks: [backend]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=4).status==200 else 1)"]
@@ -183,6 +201,91 @@ services:
       retries: 3
       start_period: 40s
     logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # Outbox relay — background worker, ALWAYS started (no profile).
+  #
+  # Drains outbox_messages and dispatches to consumers. Without it no event is
+  # ever delivered: projections never update and the checkout saga never
+  # advances past OrderPlaced. Not optional, and not part of the API process.
+  #
+  # SINGLE INSTANCE ONLY for now. Claims use FOR UPDATE SKIP LOCKED so extra
+  # replicas are safe, but OWN_UNIT_OF_WORK consumers commit outside the relay
+  # transaction (see outbox/dispatcher.py) and have not been load-tested
+  # concurrently. Scale only after that is verified.
+  # ---------------------------------------------------------------------------
+  relay:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: ecommerce-api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    # Deliberately NO `profiles`: a service with no profile is always part of the
+    # default set, so `docker compose up`, `--profile dev up` and `--profile prod
+    # up` all start it. It was previously gated on ["prod","dev"], which meant a
+    # startup that named services explicitly (e.g. `up -d api`) silently left the
+    # relay down — and with it, every projection and the whole checkout saga.
+    command: ["python", "-m", "src.shared_kernel.infrastructure.outbox.runner"]
+    environment:
+      <<: *app-env
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks: [backend]
+    # The image's HEALTHCHECK probes the API on :8000, which a worker does not
+    # serve — inherited unchanged it pins these containers to "unhealthy" and
+    # masks real failures. Workers have no HTTP surface to probe.
+    healthcheck:
+      disable: true
+    logging: *default-logging
+    deploy:
+      replicas: 1
+      resources:
+        limits: { cpus: "1.0", memory: 512m }
+
+  # ---------------------------------------------------------------------------
+  # Inventory reservation TTL sweeper — background worker, ALWAYS started.
+  #
+  # Expires held reservations past their TTL and emits inventory.InventoryExpired
+  # so the checkout saga can release the order. Without it, held stock is never
+  # returned and an order whose hold lapsed still reaches payment — the ADR-0009
+  # D1 oversell path. Deploying the code without this service leaves that open.
+  #
+  # Safe to run multiple replicas (claims are FOR UPDATE SKIP LOCKED), but one is
+  # sufficient at current volume.
+  # ---------------------------------------------------------------------------
+  inventory-expiry:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: ecommerce-api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    # Deliberately NO `profiles` — see the relay above for the reasoning.
+    command: ["python", "-m", "src.modules.inventory.infrastructure.expiry_worker"]
+    environment:
+      <<: *app-env
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks: [backend]
+    # The image's HEALTHCHECK probes the API on :8000, which a worker does not
+    # serve — inherited unchanged it pins these containers to "unhealthy" and
+    # masks real failures. Workers have no HTTP surface to probe.
+    healthcheck:
+      disable: true
+    logging: *default-logging
+    deploy:
+      replicas: 1
+      resources:
+        limits: { cpus: "0.5", memory: 256m }
 
   # ---------------------------------------------------------------------------
   # pgAdmin — DEVELOPMENT only

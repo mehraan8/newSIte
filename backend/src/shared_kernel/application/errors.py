@@ -55,3 +55,25 @@ class RateLimitedError(AppError):
     code = "rate_limited"
     http_status = 429
     message_fa = "تعداد درخواست‌ها بیش از حد مجاز است. لطفاً بعداً تلاش کنید."
+
+
+class ConcurrencyConflictError(AppError):
+    """Optimistic-lock / unique-violation conflict — caller should retry."""
+
+    code = "concurrency_conflict"
+    http_status = 409
+    message_fa = "تداخل همزمانی رخ داد. لطفاً دوباره تلاش کنید."
+
+
+class CapabilityUnavailableError(AppError):
+    """A capability that exists in the design but is deliberately withdrawn.
+
+    503 rather than 501: the operation is supported by the architecture and will
+    return once its prerequisite lands, so "try again later" is accurate where
+    "not implemented" would imply it is unsupported. Distinct from ForbiddenError
+    — the caller did nothing wrong and no permission would change the outcome.
+    """
+
+    code = "capability_unavailable"
+    http_status = 503
+    message_fa = "این قابلیت موقتاً در دسترس نیست."
